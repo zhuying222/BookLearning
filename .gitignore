@@ -1,0 +1,38 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Backend
+backend/.venv/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/*.egg-info/
+*.pyc
+*.pyo
+
+# Project data
+data/*
+exports/*
+logs/*
+!data/.gitkeep
+!exports/.gitkeep
+!logs/.gitkeep
+
+# Environment / secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+*.tmp

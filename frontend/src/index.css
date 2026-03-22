@@ -1,0 +1,97 @@
+:root {
+  --bg: #f2ede5;
+  --panel: rgba(255, 250, 244, 0.78);
+  --surface: rgba(255, 255, 255, 0.74);
+  --text: #4c443d;
+  --text-h: #1d1a17;
+  --muted: #756b61;
+  --muted-strong: #5d554d;
+  --border: rgba(85, 61, 33, 0.14);
+  --border-strong: rgba(143, 102, 45, 0.28);
+  --accent: #b26e18;
+  --accent-strong: #8b4f06;
+  --shadow-soft:
+    rgba(72, 52, 28, 0.08) 0 20px 36px -24px,
+    rgba(72, 52, 28, 0.12) 0 16px 28px -26px;
+  --shadow-button:
+    rgba(178, 110, 24, 0.24) 0 10px 20px -12px,
+    rgba(178, 110, 24, 0.18) 0 8px 12px -12px;
+  --sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --heading: Georgia, 'Times New Roman', 'Noto Serif SC', serif;
+  --mono: 'Cascadia Code', Consolas, monospace;
+  font: 16px/1.55 var(--sans);
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(206, 150, 90, 0.18), transparent 25%),
+    radial-gradient(circle at top right, rgba(160, 123, 72, 0.14), transparent 22%),
+    linear-gradient(180deg, #efe7db 0%, #f6f1e9 48%, #efe8dd 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(130, 98, 63, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(130, 98, 63, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+  pointer-events: none;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.55), transparent 92%);
+}
+
+#root {
+  max-width: 1600px;
+  margin: 0 auto;
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  color: var(--text-h);
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  letter-spacing: -0.03em;
+}
+
+h1 {
+  font-size: clamp(2.4rem, 4vw, 4.8rem);
+  line-height: 0.96;
+  margin-bottom: 16px;
+}
+
+h2 {
+  font-size: 1.35rem;
+}
+
+p {
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}

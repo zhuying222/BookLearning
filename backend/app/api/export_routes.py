@@ -26,6 +26,7 @@ async def export_pdf(req: ExportPdfRequest):
             pages=req.pages,
             page_images_base64=req.page_images_base64,
             explanations=req.explanations,
+            sheet_images_base64=req.sheet_images_base64,
         )
     except ValueError as exc:
         log_activity(

@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import 'katex/dist/katex.min.css'
+import rehypeKatex from 'rehype-katex'
 import Markdown from 'react-markdown'
+import remarkMath from 'remark-math'
 import { saveEditedExplanation } from '../lib/api'
+import { normalizeMathMarkdown } from '../lib/mathMarkdown'
 
 type Props = {
   locale: 'zh' | 'en'
@@ -27,6 +31,10 @@ export default function ExplanationPanel({
   const [editText, setEditText] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
+  const renderedExplanation = useMemo(
+    () => normalizeMathMarkdown(explanation || ''),
+    [explanation],
+  )
 
   // 切换页面时退出编辑模式
   useEffect(() => {
@@ -115,7 +123,9 @@ export default function ExplanationPanel({
           </div>
         ) : explanation ? (
           <div className="explanation-content">
-            <Markdown>{explanation}</Markdown>
+            <Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+              {renderedExplanation}
+            </Markdown>
           </div>
         ) : (
           <div className="explanation-empty">

@@ -435,6 +435,17 @@
 
 .explanation-content strong { color: var(--text-h); }
 
+.explanation-content .katex {
+  font-size: 1.02em;
+}
+
+.explanation-content .katex-display {
+  margin: 0.7em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+}
+
 .explanation-empty {
   display: grid;
   place-content: center;

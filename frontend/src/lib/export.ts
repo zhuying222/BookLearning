@@ -1,16 +1,25 @@
 import { marked } from 'marked'
+import { toPng } from 'html-to-image'
+import katex from 'katex'
+import katexCssText from 'katex/dist/katex.min.css?inline'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 
+import { normalizeMathMarkdown } from './mathMarkdown'
 import { renderPdfPageToDataUrl } from './pdf'
-
 const API_BASE = 'http://localhost:8000/api/v1'
 const FIRST_PAGE_TEXT_CAPACITY = 2400
 const CONTINUATION_COLUMN_CAPACITY = 2200
+const CAPTURE_SHEET_WIDTH = 1400
+const CAPTURE_SHEET_HEIGHT = Math.round((CAPTURE_SHEET_WIDTH * 210) / 297)
 
 type PageData = {
   pageNum: number
   dataUrl: string
   explanation: string
+}
+
+type ExportSheet = {
+  html: string
 }
 
 type ContinuationSheet = {
@@ -52,14 +61,18 @@ export async function exportAsHtml(
     ? allPages(pageCount)
     : sortedParsedPages(explanations)
 
-  const body = await buildBody(
+  const sheets = await buildSheets(
     pdfDocument,
     explanations,
     pages,
     exportScale,
     onProgress,
   )
-  const html = wrapHtml(pdfFileName, body, false)
+  const html = wrapHtml(
+    pdfFileName,
+    sheets.map((sheet) => sheet.html).join('\n'),
+    false,
+  )
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
   downloadBlob(blob, `${stripExt(pdfFileName)}_讲解_${dateTag()}.html`)
 }
@@ -77,14 +90,21 @@ export async function exportAsPdf(
     ? allPages(pageCount)
     : sortedParsedPages(explanations)
 
-  const pageImagesBase64: Record<string, string> = {}
-  for (let index = 0; index < pages.length; index += 1) {
-    const pageNum = pages[index]
-    onProgress?.(index, pages.length)
-    const image = await renderPdfPageToDataUrl(pdfDocument, pageNum, exportScale)
-    pageImagesBase64[String(pageNum)] = image.dataUrl.replace(/^data:image\/png;base64,/, '')
+  const sheets = await buildSheets(
+    pdfDocument,
+    explanations,
+    pages,
+    exportScale,
+    onProgress,
+  )
+  const total = Math.max(1, pages.length + sheets.length)
+  const sheetImagesBase64: string[] = []
+
+  for (let index = 0; index < sheets.length; index += 1) {
+    onProgress?.(pages.length + index, total)
+    sheetImagesBase64.push(await renderSheetToBase64(sheets[index].html))
   }
-  onProgress?.(pages.length, pages.length)
+  onProgress?.(total, total)
 
   const response = await fetch(`${API_BASE}/export/pdf`, {
     method: 'POST',
@@ -92,10 +112,11 @@ export async function exportAsPdf(
     body: JSON.stringify({
       pdf_file_name: pdfFileName,
       pages,
-      page_images_base64: pageImagesBase64,
+      page_images_base64: {},
       explanations: Object.fromEntries(
         Object.entries(explanations).map(([key, value]) => [String(key), value]),
       ),
+      sheet_images_base64: sheetImagesBase64,
     }),
   })
 
@@ -120,53 +141,50 @@ function allPages(pageCount: number): number[] {
   return Array.from({ length: pageCount }, (_, index) => index + 1)
 }
 
-async function buildBody(
+async function buildSheets(
   pdfDocument: PDFDocumentProxy,
   explanations: Record<number, string>,
   pages: number[],
   exportScale: number,
   onProgress?: (done: number, total: number) => void,
-): Promise<string> {
-  const allData: PageData[] = []
+): Promise<ExportSheet[]> {
+  const allSheets: ExportSheet[] = []
 
   for (let index = 0; index < pages.length; index += 1) {
     const pageNum = pages[index]
-    onProgress?.(index, pages.length)
+    onProgress?.(index, Math.max(1, pages.length * 2))
 
     const image = await renderPdfPageToDataUrl(pdfDocument, pageNum, exportScale)
     const explanation = explanations[pageNum]?.trim() || ''
-
-    allData.push({
+    const pageData: PageData = {
       pageNum,
       dataUrl: image.dataUrl,
       explanation,
-    })
+    }
+    allSheets.push(...buildPageSheets(pageData))
   }
 
-  onProgress?.(pages.length, pages.length)
-
-  return allData
-    .map((pageData) => buildPageSheets(pageData))
-    .join('\n')
+  onProgress?.(pages.length, Math.max(1, pages.length * 2))
+  return allSheets
 }
 
-function buildPageSheets(pageData: PageData): string {
+function buildPageSheets(pageData: PageData): ExportSheet[] {
   const explanation = pageData.explanation.trim()
 
   if (!explanation) {
-    return buildFirstSheet(pageData, '', true)
+    return [{ html: buildFirstSheet(pageData, '', true) }]
   }
 
   const chunks = paginateExplanation(explanation)
-  const sheets: string[] = []
+  const sheets: ExportSheet[] = []
 
-  sheets.push(buildFirstSheet(pageData, chunks.firstHtml, false))
+  sheets.push({ html: buildFirstSheet(pageData, chunks.firstHtml, false) })
 
   for (const continuation of chunks.continuations) {
-    sheets.push(buildContinuationSheet(pageData.pageNum, continuation))
+    sheets.push({ html: buildContinuationSheet(pageData.pageNum, continuation) })
   }
 
-  return sheets.join('\n')
+  return sheets
 }
 
 function paginateExplanation(explanation: string): {
@@ -245,7 +263,7 @@ function renderBlocks(blocks: string[]): string {
     return ''
   }
 
-  return marked.parse(blocks.join('\n\n')) as string
+  return renderMarkdownWithMath(blocks.join('\n\n'))
 }
 
 function buildFirstSheet(
@@ -292,38 +310,6 @@ function buildContinuationSheet(
 }
 
 function wrapHtml(title: string, body: string, forPrint: boolean): string {
-  const printStyles = forPrint
-    ? `
-    @page {
-      size: A4 landscape;
-      margin: 8mm;
-    }
-    body {
-      background: #fff;
-    }
-    .export-header {
-      display: none;
-    }
-    .export-sheet {
-      page-break-after: always;
-    }
-    .export-sheet:last-of-type {
-      page-break-after: auto;
-    }
-    .sheet-grid,
-    .sheet-panel,
-    .page-label,
-    .continuation-marker {
-      break-inside: auto;
-      page-break-inside: auto;
-    }
-    .sheet-panel--pdf img {
-      break-inside: avoid;
-      page-break-inside: avoid;
-    }
-    `
-    : ''
-
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -331,6 +317,48 @@ function wrapHtml(title: string, body: string, forPrint: boolean): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)} - BookLearning 讲解</title>
 <style>
+  ${buildExportStyles(forPrint)}
+</style>
+</head>
+<body>
+  ${buildExportBody(title, body)}
+</body>
+</html>`
+}
+
+function buildExportStyles(forPrint: boolean): string {
+  const exportModeStyles = forPrint
+    ? `
+  body {
+    background: #fff;
+  }
+  .export-header {
+    display: none;
+  }
+  .export-sheet {
+    page-break-after: always;
+    break-after: page;
+  }
+  .export-sheet:last-of-type {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .sheet-grid,
+  .sheet-panel,
+  .page-label,
+  .continuation-marker {
+    break-inside: auto;
+    page-break-inside: auto;
+  }
+  .sheet-panel--pdf img {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+    `
+    : ''
+
+  return `
+  ${katexCssText}
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -467,6 +495,15 @@ function wrapHtml(title: string, body: string, forPrint: boolean): string {
   }
   .explanation-content th { background: #f5efe6; font-weight: 600; }
   .explanation-content strong { color: #4a3520; }
+  .explanation-content .katex {
+    font-size: 1.02em;
+  }
+  .explanation-content .katex-display {
+    margin: 0.7em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.2em 0;
+  }
 
   @media screen and (max-width: 1100px) {
     .sheet-grid--first,
@@ -478,32 +515,271 @@ function wrapHtml(title: string, body: string, forPrint: boolean): string {
       border-bottom: 1px solid #e0d8cc;
     }
   }
+  ${exportModeStyles}
+  `
+}
 
-  @media print {
-    .export-sheet {
-      margin: 0;
-      border: none;
-      border-radius: 0;
-    }
-    .sheet-panel--pdf {
-      border-right: 1px solid #ccc;
-      background: #fff;
-    }
-    .continuation-marker {
-      margin-bottom: 8px;
-    }
-    ${printStyles}
+function buildCaptureStyles(): string {
+  return `
+  ${katexCssText}
+  .booklearning-export-capture,
+  .booklearning-export-capture * {
+    box-sizing: border-box;
   }
-</style>
-</head>
-<body>
+  .booklearning-export-capture {
+    width: ${CAPTURE_SHEET_WIDTH}px;
+    height: ${CAPTURE_SHEET_HEIGHT}px;
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #333;
+    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  .booklearning-export-capture .export-sheet {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    border: 1px solid #e0d8cc;
+    border-radius: 0;
+    background: #fff;
+    overflow: hidden;
+  }
+  .booklearning-export-capture .sheet-grid {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    align-items: stretch;
+  }
+  .booklearning-export-capture .sheet-grid--first,
+  .booklearning-export-capture .sheet-grid--continuation {
+    grid-template-columns: 1fr 1fr;
+  }
+  .booklearning-export-capture .sheet-panel {
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+  }
+  .booklearning-export-capture .sheet-panel--pdf {
+    position: relative;
+    padding: 12px;
+    border-right: 1px solid #e0d8cc;
+    background: #faf8f4;
+  }
+  .booklearning-export-capture .sheet-panel--pdf img {
+    display: block;
+    width: 100%;
+    height: calc(100% - 8px);
+    object-fit: contain;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    background: #fff;
+  }
+  .booklearning-export-capture .sheet-panel--text {
+    padding: 16px 20px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .booklearning-export-capture .page-label {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    background: rgba(74,53,32,0.75);
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    z-index: 1;
+  }
+  .booklearning-export-capture .continuation-marker {
+    margin-bottom: 10px;
+    color: #8a6d52;
+    font-size: 0.82rem;
+    font-weight: 700;
+  }
+  .booklearning-export-capture .explanation-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100%;
+    color: #9a8c7c;
+    font-size: 1rem;
+    border: 1px dashed #dfd4c6;
+    border-radius: 8px;
+    background: #fcfaf7;
+    padding: 16px;
+    text-align: center;
+  }
+  .booklearning-export-capture .explanation-content {
+    font-size: 0.88rem;
+    line-height: 1.72;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .booklearning-export-capture .explanation-content h1 { font-size: 1.16rem; margin: 0.8em 0 0.4em; }
+  .booklearning-export-capture .explanation-content h2 { font-size: 1.02rem; margin: 0.7em 0 0.3em; }
+  .booklearning-export-capture .explanation-content h3 { font-size: 0.94rem; margin: 0.6em 0 0.3em; }
+  .booklearning-export-capture .explanation-content p { margin: 0.45em 0; }
+  .booklearning-export-capture .explanation-content ul,
+  .booklearning-export-capture .explanation-content ol { padding-left: 1.4em; margin: 0.4em 0; }
+  .booklearning-export-capture .explanation-content li { margin: 0.2em 0; }
+  .booklearning-export-capture .explanation-content code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(178,110,24,0.08);
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 0.87em;
+  }
+  .booklearning-export-capture .explanation-content pre {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #f5f0ea;
+    overflow: hidden;
+    margin: 0.5em 0;
+  }
+  .booklearning-export-capture .explanation-content pre code { background: transparent; padding: 0; }
+  .booklearning-export-capture .explanation-content blockquote {
+    margin: 0.5em 0;
+    padding: 6px 12px;
+    border-left: 3px solid #b26e18;
+    background: rgba(178,110,24,0.04);
+  }
+  .booklearning-export-capture .explanation-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.5em 0;
+    table-layout: fixed;
+  }
+  .booklearning-export-capture .explanation-content th,
+  .booklearning-export-capture .explanation-content td {
+    padding: 6px 8px;
+    border: 1px solid #e0d8cc;
+    text-align: left;
+    word-break: break-word;
+  }
+  .booklearning-export-capture .explanation-content th { background: #f5efe6; font-weight: 600; }
+  .booklearning-export-capture .explanation-content strong { color: #4a3520; }
+  .booklearning-export-capture .explanation-content .katex {
+    font-size: 1.02em;
+  }
+  .booklearning-export-capture .explanation-content .katex-display {
+    margin: 0.7em 0;
+    overflow: hidden;
+    padding: 0.2em 0;
+  }
+  `
+}
+
+function buildExportBody(title: string, body: string): string {
+  return `
   <div class="export-header">
     <h1>${escapeHtml(title)} - BookLearning 讲解</h1>
     <p>导出时间：${new Date().toLocaleString('zh-CN')}</p>
   </div>
   ${body}
-</body>
-</html>`
+  `
+}
+
+function renderMarkdownWithMath(markdown: string): string {
+  const normalized = normalizeMathMarkdown(markdown)
+  const placeholders: string[] = []
+
+  const textWithPlaceholders = normalized
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_, expr: string) => pushMathPlaceholder(placeholders, expr, true))
+    .replace(/\$([^$\n]+)\$/g, (_, expr: string) => pushMathPlaceholder(placeholders, expr, false))
+
+  const html = marked.parse(textWithPlaceholders) as string
+  return html.replace(/@@BLMATH(\d+)@@/g, (_, indexText: string) => placeholders[Number(indexText)] || '')
+}
+
+async function renderSheetToBase64(sheetHtml: string): Promise<string> {
+  const style = document.createElement('style')
+  style.textContent = buildCaptureStyles()
+  document.head.appendChild(style)
+
+  const host = document.createElement('div')
+  host.style.position = 'fixed'
+  host.style.left = '-100000px'
+  host.style.top = '0'
+  host.style.pointerEvents = 'none'
+  host.style.opacity = '0'
+  host.innerHTML = `<div class="booklearning-export-capture">${sheetHtml}</div>`
+  document.body.appendChild(host)
+
+  try {
+    const captureNode = host.firstElementChild as HTMLElement | null
+    if (!captureNode) {
+      throw new Error('Failed to prepare PDF export sheet.')
+    }
+
+    await waitForCaptureReady(captureNode)
+
+    const dataUrl = await toPng(captureNode, {
+      cacheBust: true,
+      pixelRatio: 2,
+      backgroundColor: '#ffffff',
+      canvasWidth: CAPTURE_SHEET_WIDTH * 2,
+      canvasHeight: CAPTURE_SHEET_HEIGHT * 2,
+      width: CAPTURE_SHEET_WIDTH,
+      height: CAPTURE_SHEET_HEIGHT,
+    })
+
+    return dataUrl.replace(/^data:image\/png;base64,/, '')
+  } finally {
+    host.remove()
+    style.remove()
+  }
+}
+
+async function waitForCaptureReady(root: HTMLElement): Promise<void> {
+  const images = Array.from(root.querySelectorAll('img'))
+  await Promise.all(images.map(waitForImage))
+
+  if ('fonts' in document) {
+    try {
+      await document.fonts.ready
+    } catch {
+      // Font readiness failures should not block export.
+    }
+  }
+
+  await nextFrame()
+  await nextFrame()
+}
+
+function waitForImage(image: HTMLImageElement): Promise<void> {
+  if (image.complete) {
+    return image.decode().catch(() => undefined)
+  }
+
+  return new Promise((resolve) => {
+    const finish = () => {
+      image.removeEventListener('load', finish)
+      image.removeEventListener('error', finish)
+      resolve()
+    }
+
+    image.addEventListener('load', finish, { once: true })
+    image.addEventListener('error', finish, { once: true })
+  })
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve())
+  })
+}
+
+function pushMathPlaceholder(placeholders: string[], expr: string, displayMode: boolean): string {
+  const html = katex.renderToString(expr.trim(), {
+    displayMode,
+    throwOnError: false,
+    output: 'htmlAndMathml',
+    strict: 'ignore',
+  })
+  const index = placeholders.push(html) - 1
+  return `@@BLMATH${index}@@`
 }
 
 function downloadBlob(blob: Blob, filename: string) {

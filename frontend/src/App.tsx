@@ -449,7 +449,7 @@ function App() {
       await exportAsPdf(pdfDocument, pdfFileName, explanations, pageCount, DEFAULT_EXPORT_SCALE, exportAllPages, (done, total) => {
         setExportProgress(isZh ? `渲染页面 ${done}/${total}...` : `Rendering ${done}/${total}...`)
       })
-      setExportProgress(isZh ? '已打开打印预览' : 'Print preview opened')
+      setExportProgress(isZh ? '导出完成' : 'Export complete')
     } catch (e) {
       setExportProgress(isZh ? `导出失败：${e}` : `Failed: ${e}`)
     } finally {

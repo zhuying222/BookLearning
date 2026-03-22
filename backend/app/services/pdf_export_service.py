@@ -56,12 +56,27 @@ def generate_study_pdf(
     pages: list[int],
     page_images_base64: dict[str, str],
     explanations: dict[str, str],
+    sheet_images_base64: list[str] | None = None,
 ) -> tuple[bytes, str]:
-    _ensure_fonts()
-
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=PAGE_SIZE, pageCompression=1)
     pdf.setTitle(f"{pdf_file_name} - BookLearning 讲解")
+
+    if sheet_images_base64:
+        for sheet_image_base64 in sheet_images_base64:
+            image_bytes = base64.b64decode(sheet_image_base64)
+            _draw_full_page_image(pdf, image_bytes)
+            pdf.showPage()
+
+        pdf.save()
+        pdf_bytes = buffer.getvalue()
+
+        output_name = f"{pdf_file_name} - BookLearning 讲解.pdf"
+        output_path = Path(settings.exports_dir) / output_name
+        output_path.write_bytes(pdf_bytes)
+        return pdf_bytes, output_name
+
+    _ensure_fonts()
 
     normalized_images = {int(key): value for key, value in page_images_base64.items()}
     normalized_explanations = {
@@ -395,6 +410,19 @@ def _draw_pdf_image(
     draw_x = box_x + (box_w - draw_w) / 2
     draw_y = box_y + (box_h - draw_h) / 2
     pdf.drawImage(image, draw_x, draw_y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+
+
+def _draw_full_page_image(pdf: canvas.Canvas, image_bytes: bytes) -> None:
+    image = ImageReader(io.BytesIO(image_bytes))
+    pdf.drawImage(
+        image,
+        0,
+        0,
+        width=PAGE_WIDTH,
+        height=PAGE_HEIGHT,
+        preserveAspectRatio=False,
+        mask='auto',
+    )
 
 
 def _draw_placeholder(

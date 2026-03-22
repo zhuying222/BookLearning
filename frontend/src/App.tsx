@@ -10,7 +10,7 @@ import PromptEditor from './components/PromptEditor'
 import type { TaskStatus } from './lib/api'
 import { getTaskStatus, loadAllCachedExplanations, parseRange, parseSinglePage } from './lib/api'
 import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
-import { clamp, parsePageSelection } from './lib/pageSelection'
+import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
 import {
   loadPdfDocument,
   renderPdfPageToCanvas,
@@ -90,6 +90,8 @@ function App() {
   const [isParsingPage, setIsParsingPage] = useState(false)
   const [parseError, setParseError] = useState('')
   const [activeTask, setActiveTask] = useState<TaskStatus | null>(null)
+  const [batchRangeInput, setBatchRangeInput] = useState('')
+  const [batchPreparationStatus, setBatchPreparationStatus] = useState('')
   const [pagePrompt, setPagePrompt] = useState('')
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState('')
@@ -105,6 +107,11 @@ function App() {
   const isZh = locale === 'zh'
   const statusText = useMemo(() => getStatusText(locale, status), [locale, status])
   const displayFileName = pdfDocument ? pdfFileName : (isZh ? '未载入文件' : 'No file loaded')
+  const selectedBatchPages = useMemo(
+    () => parsePageSelection(batchRangeInput, pageCount),
+    [batchRangeInput, pageCount],
+  )
+  const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
 
   useEffect(() => {
     document.title = isZh ? 'BookLearning 阅读器' : 'BookLearning Reader'
@@ -197,29 +204,41 @@ function App() {
 
   // Poll active task
   useEffect(() => {
-    if (!activeTask || (activeTask.status !== 'running' && activeTask.status !== 'paused')) {
+    if (!activeTask || (activeTask.status !== 'pending' && activeTask.status !== 'running' && activeTask.status !== 'paused')) {
       if (taskPollRef.current) {
         clearInterval(taskPollRef.current)
         taskPollRef.current = null
       }
       return
     }
-    taskPollRef.current = setInterval(async () => {
+
+    const pollTaskStatus = async () => {
       try {
         const updated = await getTaskStatus(activeTask.task_id)
         setActiveTask(updated)
         if (updated.results) {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
         }
-        if (updated.status !== 'running' && updated.status !== 'paused') {
-          if (taskPollRef.current) clearInterval(taskPollRef.current)
+        if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
+          if (taskPollRef.current) {
+            clearInterval(taskPollRef.current)
+            taskPollRef.current = null
+          }
         }
       } catch { /* ignore polling errors */ }
-    }, 2000)
-    return () => {
-      if (taskPollRef.current) clearInterval(taskPollRef.current)
     }
-  }, [activeTask])
+
+    void pollTaskStatus()
+    taskPollRef.current = setInterval(() => {
+      void pollTaskStatus()
+    }, 1500)
+    return () => {
+      if (taskPollRef.current) {
+        clearInterval(taskPollRef.current)
+        taskPollRef.current = null
+      }
+    }
+  }, [activeTask?.task_id, activeTask?.status])
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const [file] = Array.from(event.target.files ?? [])
@@ -326,10 +345,19 @@ function App() {
 
     setParseError('')
     try {
+      setBatchPreparationStatus(
+        isZh ? `正在准备批量任务 0/${pages.length} 页...` : `Preparing batch task 0/${pages.length}...`,
+      )
       const imagesBase64: Record<number, string> = {}
-      for (const p of pages) {
+      for (let index = 0; index < pages.length; index += 1) {
+        const p = pages[index]
         const img = await renderPdfPageToDataUrl(pdfDocument, p, DEFAULT_EXPORT_SCALE)
         imagesBase64[p] = img.dataUrl.replace(/^data:image\/png;base64,/, '')
+        setBatchPreparationStatus(
+          isZh
+            ? `正在准备批量任务 ${index + 1}/${pages.length} 页...`
+            : `Preparing batch task ${index + 1}/${pages.length}...`,
+        )
       }
       const pagePrompts: Record<number, string> = {}
       if (pagePrompt) {
@@ -345,11 +373,26 @@ function App() {
         force,
       })
       setActiveTask(task)
+      setBatchPreparationStatus('')
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Failed'
       setParseError(msg)
+      setBatchPreparationStatus('')
     }
-  }, [pdfDocument, pdfHash, pageCount, pagePrompt])
+  }, [pdfDocument, pdfHash, pageCount, pagePrompt, isZh])
+
+  const handleToggleCurrentPageInBatch = useCallback((checked: boolean) => {
+    if (pageCount === 0) return
+
+    const nextPages = new Set(selectedBatchPages)
+    if (checked) {
+      nextPages.add(currentPage)
+    } else {
+      nextPages.delete(currentPage)
+    }
+
+    setBatchRangeInput(formatPageSelection([...nextPages]))
+  }, [currentPage, pageCount, selectedBatchPages])
 
   const hasExplanations = Object.keys(explanations).length > 0
 
@@ -491,6 +534,15 @@ function App() {
               <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage + 1)} disabled={!pdfDocument || currentPage >= pageCount}>
                 {isZh ? '下一页' : 'Next'}
               </button>
+              <label className="ctrl-check">
+                <input
+                  type="checkbox"
+                  checked={isCurrentPageInBatch}
+                  onChange={(e) => handleToggleCurrentPageInBatch(e.target.checked)}
+                  disabled={!pdfDocument}
+                />
+                {isZh ? '加入批量' : 'Batch'}
+              </label>
               <button type="button" className="ctrl-btn ctrl-btn--primary" onClick={handleParseCurrent} disabled={!pdfDocument || isParsingPage}>
                 {isParsingPage ? (isZh ? '解析中...' : 'Parsing...') : (isZh ? '解析当前页' : 'Parse page')}
               </button>
@@ -507,13 +559,14 @@ function App() {
             <ParseControls
               locale={locale}
               disabled={!pdfDocument}
-              isParsingPage={isParsingPage}
               activeTask={activeTask}
-              onParseCurrent={handleParseCurrent}
+              rangeInput={batchRangeInput}
+              onRangeInputChange={setBatchRangeInput}
               onParseRange={handleParseRange}
               pagePrompt={pagePrompt}
               onPagePromptChange={setPagePrompt}
               onTaskUpdate={setActiveTask}
+              batchPreparationStatus={batchPreparationStatus}
             />
 
             {/* Export row */}

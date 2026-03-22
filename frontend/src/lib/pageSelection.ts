@@ -44,3 +44,29 @@ export function parsePageSelection(
 
   return [...pages].sort((left, right) => left - right)
 }
+
+export function formatPageSelection(pages: number[]): string {
+  if (pages.length === 0) {
+    return ''
+  }
+
+  const sortedPages = [...new Set(pages)].sort((left, right) => left - right)
+  const segments: string[] = []
+  let start = sortedPages[0]
+  let end = sortedPages[0]
+
+  for (let index = 1; index < sortedPages.length; index += 1) {
+    const page = sortedPages[index]
+    if (page === end + 1) {
+      end = page
+      continue
+    }
+
+    segments.push(start === end ? String(start) : `${start}-${end}`)
+    start = page
+    end = page
+  }
+
+  segments.push(start === end ? String(start) : `${start}-${end}`)
+  return segments.join(', ')
+}

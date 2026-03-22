@@ -5,28 +5,35 @@ import { cancelTask, pauseTask, resumeTask } from '../lib/api'
 type Props = {
   locale: 'zh' | 'en'
   disabled: boolean
-  isParsingPage: boolean
   activeTask: TaskStatus | null
-  onParseCurrent: () => void
+  rangeInput: string
+  onRangeInputChange: (value: string) => void
   onParseRange: (pages: string, force: boolean) => void
   pagePrompt: string
   onPagePromptChange: (value: string) => void
   onTaskUpdate: (task: TaskStatus | null) => void
+  batchPreparationStatus: string
 }
 
 export default function ParseControls({
   locale,
   disabled,
   activeTask,
+  rangeInput,
+  onRangeInputChange,
   onParseRange,
   pagePrompt,
   onPagePromptChange,
   onTaskUpdate,
+  batchPreparationStatus,
 }: Props) {
-  const [rangeInput, setRangeInput] = useState('')
   const [forceReparse, setForceReparse] = useState(false)
   const isZh = locale === 'zh'
-  const isTaskRunning = activeTask && (activeTask.status === 'running' || activeTask.status === 'paused')
+  const isTaskRunning = activeTask && (
+    activeTask.status === 'pending'
+    || activeTask.status === 'running'
+    || activeTask.status === 'paused'
+  )
 
   const handlePause = async () => {
     if (!activeTask) return
@@ -72,7 +79,7 @@ export default function ParseControls({
           className="ctrl-input"
           type="text"
           value={rangeInput}
-          onChange={(e) => setRangeInput(e.target.value)}
+          onChange={(e) => onRangeInputChange(e.target.value)}
           placeholder="1-5, 8, 10-12"
         />
         <button
@@ -89,11 +96,20 @@ export default function ParseControls({
         </label>
       </div>
 
+      {batchPreparationStatus && (
+        <div className="ctrl-status">
+          <span>{batchPreparationStatus}</span>
+        </div>
+      )}
+
       {/* 任务进度 */}
       {activeTask && (
         <div className="task-bar">
           <div className="task-bar-header">
-            <span>{activeTask.status}</span>
+            <span>
+              {activeTask.status}
+              {typeof activeTask.current_page === 'number' && ` · ${isZh ? '当前页' : 'Page'} ${activeTask.current_page}`}
+            </span>
             <span>{activeTask.completed_pages}/{activeTask.total_pages}</span>
           </div>
           <div className="progress-bar">

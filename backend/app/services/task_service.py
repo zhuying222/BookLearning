@@ -193,6 +193,7 @@ def create_task(
         force=force,
     )
     _tasks[task.task_id] = task
+    task.status = "running"
     task._task = asyncio.create_task(task.run())
     return task
 

@@ -1,6 +1,15 @@
 from pydantic import BaseModel
 
 
+class ParseCostInfo(BaseModel):
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_amount: float | None = None
+    cost_unit: str | None = None
+    cost_display: str | None = None
+
+
 class ParsePageRequest(BaseModel):
     pdf_hash: str
     page_number: int
@@ -25,6 +34,7 @@ class ParsePageResponse(BaseModel):
     explanation: str
     model_name: str
     cached: bool = False
+    cost_info: ParseCostInfo | None = None
 
 
 class TaskStatusResponse(BaseModel):
@@ -34,4 +44,5 @@ class TaskStatusResponse(BaseModel):
     completed_pages: int
     current_page: int | None = None
     results: dict[int, str] = {}
+    page_costs: dict[int, ParseCostInfo] = {}
     error: str | None = None

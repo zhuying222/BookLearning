@@ -4,9 +4,10 @@ import uuid
 
 from app.core.redaction import redact_sensitive_text
 from app.models.ai_config import AiConfig
+from app.models.parse import ParseCostInfo
 from app.services.activity_service import log_activity
 from app.services.ai_service import call_vision_model
-from app.services.cache_service import get_cached_result, get_page_summary, save_cached_result
+from app.services.cache_service import get_cached_record, get_page_summary, save_cached_result
 from app.services.prompt_service import get_prompt_config
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class ParseTask:
         self.completed_pages = 0
         self.current_page: int | None = None
         self.results: dict[int, str] = {}
+        self.page_costs: dict[int, ParseCostInfo] = {}
         self.error: str | None = None
 
         self._cancel_event = asyncio.Event()
@@ -55,6 +57,7 @@ class ParseTask:
             "completed_pages": self.completed_pages,
             "current_page": self.current_page,
             "results": self.results,
+            "page_costs": {page: cost.model_dump() for page, cost in self.page_costs.items()},
             "error": self.error,
         }
 
@@ -77,7 +80,7 @@ class ParseTask:
                 user_prompt = self.page_prompts.get(page_num, prompt_config.user_prompt_template)
 
                 if not self.force:
-                    cached = get_cached_result(
+                    cached = get_cached_record(
                         self.pdf_hash,
                         page_num,
                         self.config.model_name,
@@ -85,7 +88,10 @@ class ParseTask:
                         user_prompt,
                     )
                     if cached is not None:
-                        self.results[page_num] = cached
+                        self.results[page_num] = cached.get("explanation", "")
+                        cost_info = cached.get("cost_info")
+                        if isinstance(cost_info, dict):
+                            self.page_costs[page_num] = ParseCostInfo(**cost_info)
                         self.completed_pages += 1
                         continue
 
@@ -97,7 +103,7 @@ class ParseTask:
                     self.completed_pages += 1
                     continue
 
-                explanation = await call_vision_model(
+                explanation, cost_info = await call_vision_model(
                     config=self.config,
                     image_base64=image_b64,
                     page_prompt=user_prompt if user_prompt != prompt_config.user_prompt_template else None,
@@ -111,9 +117,12 @@ class ParseTask:
                     prompt_config.system_prompt,
                     user_prompt,
                     explanation,
+                    ParseCostInfo(**cost_info.__dict__) if cost_info else None,
                 )
 
                 self.results[page_num] = explanation
+                if cost_info:
+                    self.page_costs[page_num] = ParseCostInfo(**cost_info.__dict__)
                 self.completed_pages += 1
 
             self.status = "completed"

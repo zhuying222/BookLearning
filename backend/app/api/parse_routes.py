@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.core.redaction import redact_sensitive_text
-from app.models.parse import ParsePageRequest, ParsePageResponse, ParseRangeRequest, TaskStatusResponse
+from app.models.parse import ParseCostInfo, ParsePageRequest, ParsePageResponse, ParseRangeRequest, TaskStatusResponse
 from app.services import ai_config_service, cache_service, task_service
 from app.services.activity_service import log_activity
 from app.services.ai_service import call_vision_model
@@ -28,23 +28,25 @@ async def parse_single_page(req: ParsePageRequest):
     user_prompt = req.page_prompt or prompt_cfg.user_prompt_template
 
     if not req.force:
-        cached = cache_service.get_cached_result(
+        cached = cache_service.get_cached_record(
             req.pdf_hash, req.page_number, config.model_name,
             prompt_cfg.system_prompt, user_prompt,
         )
         if cached is not None:
+            cost_info = cached.get("cost_info")
             return ParsePageResponse(
                 pdf_hash=req.pdf_hash,
                 page_number=req.page_number,
-                explanation=cached,
+                explanation=cached.get("explanation", ""),
                 model_name=config.model_name,
                 cached=True,
+                cost_info=ParseCostInfo(**cost_info) if isinstance(cost_info, dict) else None,
             )
 
     context_summary = _build_context_for_page(req.pdf_hash, req.page_number)
 
     try:
-        explanation = await call_vision_model(
+        explanation, cost_info = await call_vision_model(
             config=config,
             image_base64=req.image_base64,
             page_prompt=req.page_prompt,
@@ -62,6 +64,7 @@ async def parse_single_page(req: ParsePageRequest):
     cache_service.save_cached_result(
         req.pdf_hash, req.page_number, config.model_name,
         prompt_cfg.system_prompt, user_prompt, explanation,
+        ParseCostInfo(**cost_info.__dict__) if cost_info else None,
     )
 
     logger.info("Parsed page %d for pdf=%s (model=%s)", req.page_number, req.pdf_hash[:8], config.model_name)
@@ -71,6 +74,7 @@ async def parse_single_page(req: ParsePageRequest):
         page_number=req.page_number,
         explanation=explanation,
         model_name=config.model_name,
+        cost_info=ParseCostInfo(**cost_info.__dict__) if cost_info else None,
     )
 
 
@@ -140,10 +144,15 @@ async def list_tasks():
 
 @router.get("/cache/{pdf_hash}/{page_number}")
 async def get_cached(pdf_hash: str, page_number: int):
-    result = cache_service.get_full_explanation(pdf_hash, page_number)
+    result = cache_service.get_full_record(pdf_hash, page_number)
     if result is None:
         raise HTTPException(status_code=404, detail="No cached result")
-    return {"pdf_hash": pdf_hash, "page_number": page_number, "explanation": result}
+    return {
+        "pdf_hash": pdf_hash,
+        "page_number": page_number,
+        "explanation": result.get("explanation"),
+        "cost_info": result.get("cost_info"),
+    }
 
 
 @router.put("/cache/{pdf_hash}/{page_number}")
@@ -161,15 +170,18 @@ async def get_all_cached(pdf_hash: str):
     from pathlib import Path
     cache_dir = Path(cache_service.settings.cache_dir) / pdf_hash
     if not cache_dir.exists():
-        return {"pdf_hash": pdf_hash, "pages": {}}
+        return {"pdf_hash": pdf_hash, "pages": {}, "page_costs": {}}
     results: dict[int, str] = {}
+    page_costs: dict[int, dict] = {}
     for f in sorted(cache_dir.glob("page_*.json")):
         import json
         data = json.loads(f.read_text(encoding="utf-8"))
         page_num = data.get("page_number")
         if page_num is not None and page_num not in results:
             results[page_num] = data.get("explanation", "")
-    return {"pdf_hash": pdf_hash, "pages": results}
+            if isinstance(data.get("cost_info"), dict):
+                page_costs[page_num] = data["cost_info"]
+    return {"pdf_hash": pdf_hash, "pages": results, "page_costs": page_costs}
 
 
 def _build_context_for_page(pdf_hash: str, page_number: int, context_pages: int = 2) -> str | None:

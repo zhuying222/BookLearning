@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from app.core.config import settings
+from app.models.parse import ParseCostInfo
 
 
 def _cache_key(pdf_hash: str, page_number: int, model_name: str, prompt_hash: str) -> Path:
@@ -21,12 +22,18 @@ def _hash_prompt(system_prompt: str, user_prompt: str) -> str:
 def get_cached_result(
     pdf_hash: str, page_number: int, model_name: str, system_prompt: str, user_prompt: str
 ) -> str | None:
+    record = get_cached_record(pdf_hash, page_number, model_name, system_prompt, user_prompt)
+    return record["explanation"] if record else None
+
+
+def get_cached_record(
+    pdf_hash: str, page_number: int, model_name: str, system_prompt: str, user_prompt: str
+) -> dict | None:
     prompt_hash = _hash_prompt(system_prompt, user_prompt)
     path = _cache_key(pdf_hash, page_number, model_name, prompt_hash)
     if not path.exists():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("explanation")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def save_cached_result(
@@ -36,6 +43,7 @@ def save_cached_result(
     system_prompt: str,
     user_prompt: str,
     explanation: str,
+    cost_info: ParseCostInfo | None = None,
 ) -> None:
     prompt_hash = _hash_prompt(system_prompt, user_prompt)
     path = _cache_key(pdf_hash, page_number, model_name, prompt_hash)
@@ -45,6 +53,7 @@ def save_cached_result(
         "model_name": model_name,
         "prompt_hash": prompt_hash,
         "explanation": explanation,
+        "cost_info": cost_info.model_dump() if cost_info else None,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -97,6 +106,15 @@ def get_full_explanation(pdf_hash: str, page_number: int) -> str | None:
     for f in cache_dir.glob(f"page_{page_number}_*.json"):
         data = json.loads(f.read_text(encoding="utf-8"))
         return data.get("explanation")
+    return None
+
+
+def get_full_record(pdf_hash: str, page_number: int) -> dict | None:
+    cache_dir = Path(settings.cache_dir) / pdf_hash
+    if not cache_dir.exists():
+        return None
+    for f in cache_dir.glob(f"page_{page_number}_*.json"):
+        return json.loads(f.read_text(encoding="utf-8"))
     return None
 
 

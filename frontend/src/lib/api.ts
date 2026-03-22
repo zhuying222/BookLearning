@@ -67,6 +67,16 @@ export type ParsePageResponse = {
   explanation: string
   model_name: string
   cached: boolean
+  cost_info: ParseCostInfo | null
+}
+
+export type ParseCostInfo = {
+  input_tokens: number | null
+  output_tokens: number | null
+  total_tokens: number | null
+  cost_amount: number | null
+  cost_unit: string | null
+  cost_display: string | null
 }
 
 export type TaskStatus = {
@@ -76,6 +86,7 @@ export type TaskStatus = {
   completed_pages: number
   current_page: number | null
   results: Record<number, string>
+  page_costs: Record<number, ParseCostInfo>
   error: string | null
 }
 
@@ -126,5 +137,5 @@ export function saveEditedExplanation(pdfHash: string, pageNumber: number, expla
 }
 
 export function loadAllCachedExplanations(pdfHash: string) {
-  return request<{ pdf_hash: string; pages: Record<number, string> }>(`/parse/cache/${pdfHash}`)
+  return request<{ pdf_hash: string; pages: Record<number, string>; page_costs: Record<number, ParseCostInfo> }>(`/parse/cache/${pdfHash}`)
 }

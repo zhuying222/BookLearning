@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, WheelEvent } from 'react'
+import type { CSSProperties, ChangeEvent, KeyboardEvent as ReactKeyboardEvent, WheelEvent } from 'react'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 
 import './App.css'
@@ -7,7 +7,7 @@ import AiConfigPanel from './components/AiConfigPanel'
 import ExplanationPanel from './components/ExplanationPanel'
 import ParseControls from './components/ParseControls'
 import PromptEditor from './components/PromptEditor'
-import type { TaskStatus } from './lib/api'
+import type { ParseCostInfo, TaskStatus } from './lib/api'
 import { getTaskStatus, loadAllCachedExplanations, parseRange, parseSinglePage } from './lib/api'
 import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
@@ -23,6 +23,8 @@ const DEFAULT_SCALE = 1.1
 const DEFAULT_EXPORT_SCALE = 1.75
 const MIN_VIEWER_RATIO = 40
 const MAX_VIEWER_RATIO = 70
+const MIN_RIGHT_TOP_RATIO = 55
+const MAX_RIGHT_TOP_RATIO = 80
 
 type Locale = 'zh' | 'en'
 
@@ -78,6 +80,8 @@ function App() {
   const [scale, setScale] = useState(DEFAULT_SCALE)
   const [viewerRatio, setViewerRatio] = useState(55)
   const [isResizing, setIsResizing] = useState(false)
+  const [rightTopRatio, setRightTopRatio] = useState(66.67)
+  const [isRightPanelResizing, setIsRightPanelResizing] = useState(false)
   const [status, setStatus] = useState<StatusState>({ key: 'idle' })
   const [loadError, setLoadError] = useState('')
   const [renderError, setRenderError] = useState('')
@@ -87,6 +91,7 @@ function App() {
   const [showAiConfig, setShowAiConfig] = useState(false)
   const [showPromptEditor, setShowPromptEditor] = useState(false)
   const [explanations, setExplanations] = useState<Record<number, string>>({})
+  const [pageCosts, setPageCosts] = useState<Record<number, ParseCostInfo>>({})
   const [isParsingPage, setIsParsingPage] = useState(false)
   const [parseError, setParseError] = useState('')
   const [activeTask, setActiveTask] = useState<TaskStatus | null>(null)
@@ -101,6 +106,7 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const viewerRef = useRef<HTMLDivElement | null>(null)
   const splitLayoutRef = useRef<HTMLDivElement | null>(null)
+  const rightPanelRef = useRef<HTMLElement | null>(null)
   const pdfBytesRef = useRef<Uint8Array | null>(null)
   const taskPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -112,6 +118,8 @@ function App() {
     [batchRangeInput, pageCount],
   )
   const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
+  const documentCostSummary = useMemo(() => summarizeDocumentCost(pageCosts), [pageCosts])
+  const documentUsageSummary = useMemo(() => summarizeDocumentUsage(pageCosts), [pageCosts])
 
   useEffect(() => {
     document.title = isZh ? 'BookLearning 阅读器' : 'BookLearning Reader'
@@ -146,6 +154,23 @@ function App() {
       window.removeEventListener('pointerup', stopResizing)
     }
   }, [isResizing])
+
+  useEffect(() => {
+    if (!isRightPanelResizing) return
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!rightPanelRef.current) return
+      const rect = rightPanelRef.current.getBoundingClientRect()
+      const nextRatio = ((event.clientY - rect.top) / rect.height) * 100
+      setRightTopRatio(clamp(nextRatio, MIN_RIGHT_TOP_RATIO, MAX_RIGHT_TOP_RATIO))
+    }
+    const stopResizing = () => setIsRightPanelResizing(false)
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', stopResizing)
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResizing)
+    }
+  }, [isRightPanelResizing])
 
   // Render current page
   useEffect(() => {
@@ -219,6 +244,9 @@ function App() {
         if (updated.results) {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
         }
+        if (updated.page_costs) {
+          setPageCosts((prev) => ({ ...prev, ...updated.page_costs }))
+        }
         if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
           setBatchRangeInput('')
           if (taskPollRef.current) {
@@ -253,6 +281,7 @@ function App() {
     setRenderError('')
     setParseError('')
     setExplanations({})
+    setPageCosts({})
     setActiveTask(null)
     setStatus({ key: 'loadingPdf', fileName: file.name })
     try {
@@ -277,6 +306,13 @@ function App() {
             mapped[Number(k)] = v
           }
           setExplanations(mapped)
+        }
+        if (data.page_costs) {
+          const mappedCosts: Record<number, ParseCostInfo> = {}
+          for (const [k, v] of Object.entries(data.page_costs)) {
+            mappedCosts[Number(k)] = v
+          }
+          setPageCosts(mappedCosts)
         }
       }).catch(() => { /* 无缓存忽略 */ })
     } catch (error) {
@@ -329,6 +365,10 @@ function App() {
         force: false,
       })
       setExplanations((prev) => ({ ...prev, [currentPage]: result.explanation }))
+      const costInfo = result.cost_info
+      if (costInfo) {
+        setPageCosts((prev) => ({ ...prev, [currentPage]: costInfo }))
+      }
       setStatus({ key: 'parsed', page: currentPage })
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Parse failed'
@@ -510,22 +550,41 @@ function App() {
           onPointerDown={() => setIsResizing(true)}
         />
 
-        {/* ---- Right: Explanation (3/5) + Controls (2/5) ---- */}
-        <aside className="right-panel">
-          {/* Explanation area - takes 3/5 */}
+        {/* ---- Right: Explanation + Controls with draggable split ---- */}
+        <aside
+          ref={rightPanelRef}
+          className={`right-panel${isRightPanelResizing ? ' right-panel--resizing' : ''}`}
+          style={
+            {
+              '--right-top-size': `${rightTopRatio}fr`,
+              '--right-bottom-size': `${100 - rightTopRatio}fr`,
+            } as CSSProperties
+          }
+        >
+          {/* Explanation area - takes 2/3 */}
           <div className="right-top">
             <ExplanationPanel
               locale={locale}
               currentPage={currentPage}
               explanations={explanations}
+              pageCosts={pageCosts}
+              documentUsageSummary={documentUsageSummary}
               isLoading={isParsingPage}
               pageCount={pageCount}
               pdfHash={pdfHash}
               onExplanationUpdate={(page, text) => setExplanations((prev) => ({ ...prev, [page]: text }))}
+              documentCostSummary={documentCostSummary}
             />
           </div>
 
-          {/* Controls area - takes 2/5 */}
+          <div
+            className="right-splitter"
+            role="separator"
+            aria-orientation="horizontal"
+            onPointerDown={() => setIsRightPanelResizing(true)}
+          />
+
+          {/* Controls area - takes 1/3 */}
           <div className="right-bottom">
             {/* Page navigation row */}
             <div className="ctrl-row">
@@ -613,3 +672,37 @@ function App() {
 }
 
 export default App
+
+function summarizeDocumentCost(pageCosts: Record<number, ParseCostInfo>): string {
+  const totals = new Map<string, number>()
+
+  for (const costInfo of Object.values(pageCosts)) {
+    if (typeof costInfo?.cost_amount !== 'number') {
+      continue
+    }
+    const unit = (costInfo.cost_unit || '').trim()
+    totals.set(unit, (totals.get(unit) || 0) + costInfo.cost_amount)
+  }
+
+  return [...totals.entries()]
+    .map(([unit, amount]) => `${unit}${amount.toFixed(6)}`)
+    .join(' + ')
+}
+
+function summarizeDocumentUsage(pageCosts: Record<number, ParseCostInfo>): string {
+  let inputTokens = 0
+  let outputTokens = 0
+  let totalTokens = 0
+
+  for (const costInfo of Object.values(pageCosts)) {
+    inputTokens += costInfo?.input_tokens || 0
+    outputTokens += costInfo?.output_tokens || 0
+    totalTokens += costInfo?.total_tokens || 0
+  }
+
+  if (!inputTokens && !outputTokens && !totalTokens) {
+    return ''
+  }
+
+  return `in ${inputTokens} / out ${outputTokens} / total ${totalTokens}`
+}

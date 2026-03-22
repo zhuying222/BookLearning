@@ -1,32 +1,25 @@
 import { useCallback, useEffect, useState } from 'react'
 import Markdown from 'react-markdown'
-import type { ParseCostInfo } from '../lib/api'
 import { saveEditedExplanation } from '../lib/api'
 
 type Props = {
   locale: 'zh' | 'en'
   currentPage: number
   explanations: Record<number, string>
-  pageCosts: Record<number, ParseCostInfo>
-  documentUsageSummary: string
   isLoading: boolean
   pageCount: number
   pdfHash: string
   onExplanationUpdate: (page: number, text: string) => void
-  documentCostSummary: string
 }
 
 export default function ExplanationPanel({
   locale,
   currentPage,
   explanations,
-  pageCosts,
-  documentUsageSummary,
   isLoading,
   pageCount,
   pdfHash,
   onExplanationUpdate,
-  documentCostSummary,
 }: Props) {
   const isZh = locale === 'zh'
   const explanation = explanations[currentPage]
@@ -34,7 +27,6 @@ export default function ExplanationPanel({
   const [editText, setEditText] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
-  const currentCost = pageCosts[currentPage]
 
   // 切换页面时退出编辑模式
   useEffect(() => {
@@ -85,10 +77,6 @@ export default function ExplanationPanel({
     : explanation
       ? 'page-status--parsed'
       : 'page-status--empty'
-  const totalCostText = documentCostSummary || (isZh ? '暂无（接口未返回价格）' : 'N/A (no price returned)')
-  const pageCostText = currentCost?.cost_display || (isZh ? '暂无（接口未返回价格）' : 'N/A (no price returned)')
-  const totalUsageText = documentUsageSummary || (isZh ? '暂无' : 'N/A')
-  const pageUsageText = formatUsageSummary(currentCost, locale)
 
   return (
     <div className="explanation-panel">
@@ -100,21 +88,6 @@ export default function ExplanationPanel({
             {isZh ? `第 ${currentPage} / ${pageCount} 页` : `Page ${currentPage} / ${pageCount}`}
           </span>
         </div>
-      </div>
-
-      <div className="cost-strip">
-        <span className="cost-chip">
-          {isZh ? `本文档累计成本：${totalCostText}` : `Document total: ${totalCostText}`}
-        </span>
-        <span className="cost-chip">
-          {isZh ? `当前页成本：${pageCostText}` : `Current page: ${pageCostText}`}
-        </span>
-        <span className="cost-chip">
-          {isZh ? `本文档累计 Tokens：${totalUsageText}` : `Document tokens: ${totalUsageText}`}
-        </span>
-        <span className="cost-chip">
-          {isZh ? `当前页 Tokens：${pageUsageText}` : `Current page tokens: ${pageUsageText}`}
-        </span>
       </div>
 
       <div className="explanation-body">
@@ -175,21 +148,4 @@ export default function ExplanationPanel({
       </div>
     </div>
   )
-}
-
-function formatUsageSummary(costInfo: ParseCostInfo | undefined, locale: 'zh' | 'en'): string {
-  if (!costInfo) {
-    return locale === 'zh' ? '暂无' : 'N/A'
-  }
-
-  const inputTokens = costInfo.input_tokens || 0
-  const outputTokens = costInfo.output_tokens || 0
-  const totalTokens = costInfo.total_tokens || 0
-  if (!inputTokens && !outputTokens && !totalTokens) {
-    return locale === 'zh' ? '暂无' : 'N/A'
-  }
-
-  return locale === 'zh'
-    ? `输入 ${inputTokens} / 输出 ${outputTokens} / 总计 ${totalTokens}`
-    : `in ${inputTokens} / out ${outputTokens} / total ${totalTokens}`
 }

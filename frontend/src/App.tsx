@@ -7,7 +7,7 @@ import AiConfigPanel from './components/AiConfigPanel'
 import ExplanationPanel from './components/ExplanationPanel'
 import ParseControls from './components/ParseControls'
 import PromptEditor from './components/PromptEditor'
-import type { ParseCostInfo, TaskStatus } from './lib/api'
+import type { TaskStatus } from './lib/api'
 import { getTaskStatus, loadAllCachedExplanations, parseRange, parseSinglePage } from './lib/api'
 import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
@@ -91,7 +91,6 @@ function App() {
   const [showAiConfig, setShowAiConfig] = useState(false)
   const [showPromptEditor, setShowPromptEditor] = useState(false)
   const [explanations, setExplanations] = useState<Record<number, string>>({})
-  const [pageCosts, setPageCosts] = useState<Record<number, ParseCostInfo>>({})
   const [isParsingPage, setIsParsingPage] = useState(false)
   const [parseError, setParseError] = useState('')
   const [activeTask, setActiveTask] = useState<TaskStatus | null>(null)
@@ -118,8 +117,6 @@ function App() {
     [batchRangeInput, pageCount],
   )
   const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
-  const documentCostSummary = useMemo(() => summarizeDocumentCost(pageCosts), [pageCosts])
-  const documentUsageSummary = useMemo(() => summarizeDocumentUsage(pageCosts), [pageCosts])
 
   useEffect(() => {
     document.title = isZh ? 'BookLearning 阅读器' : 'BookLearning Reader'
@@ -244,9 +241,6 @@ function App() {
         if (updated.results) {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
         }
-        if (updated.page_costs) {
-          setPageCosts((prev) => ({ ...prev, ...updated.page_costs }))
-        }
         if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
           setBatchRangeInput('')
           if (taskPollRef.current) {
@@ -281,7 +275,6 @@ function App() {
     setRenderError('')
     setParseError('')
     setExplanations({})
-    setPageCosts({})
     setActiveTask(null)
     setStatus({ key: 'loadingPdf', fileName: file.name })
     try {
@@ -306,13 +299,6 @@ function App() {
             mapped[Number(k)] = v
           }
           setExplanations(mapped)
-        }
-        if (data.page_costs) {
-          const mappedCosts: Record<number, ParseCostInfo> = {}
-          for (const [k, v] of Object.entries(data.page_costs)) {
-            mappedCosts[Number(k)] = v
-          }
-          setPageCosts(mappedCosts)
         }
       }).catch(() => { /* 无缓存忽略 */ })
     } catch (error) {
@@ -365,10 +351,6 @@ function App() {
         force: false,
       })
       setExplanations((prev) => ({ ...prev, [currentPage]: result.explanation }))
-      const costInfo = result.cost_info
-      if (costInfo) {
-        setPageCosts((prev) => ({ ...prev, [currentPage]: costInfo }))
-      }
       setStatus({ key: 'parsed', page: currentPage })
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Parse failed'
@@ -567,13 +549,10 @@ function App() {
               locale={locale}
               currentPage={currentPage}
               explanations={explanations}
-              pageCosts={pageCosts}
-              documentUsageSummary={documentUsageSummary}
               isLoading={isParsingPage}
               pageCount={pageCount}
               pdfHash={pdfHash}
               onExplanationUpdate={(page, text) => setExplanations((prev) => ({ ...prev, [page]: text }))}
-              documentCostSummary={documentCostSummary}
             />
           </div>
 
@@ -672,37 +651,3 @@ function App() {
 }
 
 export default App
-
-function summarizeDocumentCost(pageCosts: Record<number, ParseCostInfo>): string {
-  const totals = new Map<string, number>()
-
-  for (const costInfo of Object.values(pageCosts)) {
-    if (typeof costInfo?.cost_amount !== 'number') {
-      continue
-    }
-    const unit = (costInfo.cost_unit || '').trim()
-    totals.set(unit, (totals.get(unit) || 0) + costInfo.cost_amount)
-  }
-
-  return [...totals.entries()]
-    .map(([unit, amount]) => `${unit}${amount.toFixed(6)}`)
-    .join(' + ')
-}
-
-function summarizeDocumentUsage(pageCosts: Record<number, ParseCostInfo>): string {
-  let inputTokens = 0
-  let outputTokens = 0
-  let totalTokens = 0
-
-  for (const costInfo of Object.values(pageCosts)) {
-    inputTokens += costInfo?.input_tokens || 0
-    outputTokens += costInfo?.output_tokens || 0
-    totalTokens += costInfo?.total_tokens || 0
-  }
-
-  if (!inputTokens && !outputTokens && !totalTokens) {
-    return ''
-  }
-
-  return `in ${inputTokens} / out ${outputTokens} / total ${totalTokens}`
-}

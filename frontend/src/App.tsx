@@ -220,6 +220,7 @@ function App() {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
         }
         if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
+          setBatchRangeInput('')
           if (taskPollRef.current) {
             clearInterval(taskPollRef.current)
             taskPollRef.current = null

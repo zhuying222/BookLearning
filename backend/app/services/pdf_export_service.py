@@ -57,15 +57,22 @@ def generate_study_pdf(
     page_images_base64: dict[str, str],
     explanations: dict[str, str],
     sheet_images_base64: list[str] | None = None,
+    sheet_page_sizes: list[dict[str, float]] | None = None,
 ) -> tuple[bytes, str]:
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=PAGE_SIZE, pageCompression=1)
     pdf.setTitle(f"{pdf_file_name} - BookLearning 讲解")
 
     if sheet_images_base64:
-        for sheet_image_base64 in sheet_images_base64:
+        normalized_sheet_sizes = sheet_page_sizes or []
+
+        for index, sheet_image_base64 in enumerate(sheet_images_base64):
             image_bytes = base64.b64decode(sheet_image_base64)
-            _draw_full_page_image(pdf, image_bytes)
+            page_size = normalized_sheet_sizes[index] if index < len(normalized_sheet_sizes) else {}
+            page_width = float(page_size.get("width", PAGE_WIDTH))
+            page_height = float(page_size.get("height", PAGE_HEIGHT))
+            pdf.setPageSize((page_width, page_height))
+            _draw_full_page_image(pdf, image_bytes, page_width, page_height)
             pdf.showPage()
 
         pdf.save()
@@ -224,7 +231,7 @@ def build_line_entries(markdown_text: str) -> list[LineEntry]:
             )
             continue
 
-        line_text = _strip_markdown(stripped)
+        line_text = _latex_to_plain_text(_strip_markdown(stripped))
         if not line_text:
             continue
 
@@ -412,14 +419,19 @@ def _draw_pdf_image(
     pdf.drawImage(image, draw_x, draw_y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
 
 
-def _draw_full_page_image(pdf: canvas.Canvas, image_bytes: bytes) -> None:
+def _draw_full_page_image(
+    pdf: canvas.Canvas,
+    image_bytes: bytes,
+    page_width: float,
+    page_height: float,
+) -> None:
     image = ImageReader(io.BytesIO(image_bytes))
     pdf.drawImage(
         image,
         0,
         0,
-        width=PAGE_WIDTH,
-        height=PAGE_HEIGHT,
+        width=page_width,
+        height=page_height,
         preserveAspectRatio=False,
         mask='auto',
     )
@@ -460,6 +472,152 @@ def _strip_markdown(text: str) -> str:
     cleaned = cleaned.replace("**", "").replace("__", "").replace("*", "").replace("_", "")
     cleaned = cleaned.replace("|", " ")
     return cleaned.strip()
+
+
+def _latex_to_plain_text(text: str) -> str:
+    cleaned = text
+
+    # Normalize common math delimiters first.
+    cleaned = (
+        cleaned
+        .replace("\\(", "")
+        .replace("\\)", "")
+        .replace("\\[", "")
+        .replace("\\]", "")
+        .replace("$$", "")
+        .replace("$", "")
+    )
+
+    # Remove layout-only helpers that should not appear in final text.
+    cleaned = re.sub(r"\\(?:left|right|qquad|quad|,|!|;|:)\b", " ", cleaned)
+
+    # Convert common LaTeX commands to readable plain text / Unicode.
+    replacements = {
+        r"\\cdot": "·",
+        r"\\times": "×",
+        r"\\div": "÷",
+        r"\\pm": "±",
+        r"\\mp": "∓",
+        r"\\leq": "≤",
+        r"\\geq": "≥",
+        r"\\neq": "≠",
+        r"\\approx": "≈",
+        r"\\infty": "∞",
+        r"\\to": "→",
+        r"\\rightarrow": "→",
+        r"\\Rightarrow": "⇒",
+        r"\\implies": "⇒",
+        r"\\because": "∵",
+        r"\\therefore": "∴",
+        r"\\sum": "Σ",
+        r"\\prod": "Π",
+        r"\\alpha": "α",
+        r"\\beta": "β",
+        r"\\gamma": "γ",
+        r"\\theta": "θ",
+        r"\\lambda": "λ",
+        r"\\mu": "μ",
+        r"\\pi": "π",
+        r"\\sigma": "σ",
+        r"\\Delta": "Δ",
+        r"\\sin": "sin",
+        r"\\cos": "cos",
+        r"\\tan": "tan",
+        r"\\log": "log",
+        r"\\ln": "ln",
+        r"\\max": "max",
+        r"\\min": "min",
+    }
+    for pattern, replacement in replacements.items():
+        cleaned = re.sub(pattern, replacement, cleaned)
+
+    cleaned = _replace_latex_command_with_braces(cleaned, r"\\(?:d?frac|tfrac)", _format_fraction)
+    cleaned = _replace_latex_command_with_braces(cleaned, r"\\sqrt", _format_sqrt, arg_count=1)
+    cleaned = _replace_latex_command_with_braces(cleaned, r"\\text", _format_text, arg_count=1)
+
+    # Normalize brace-wrapped identifiers like a{n+1} -> a_{n+1}
+    cleaned = re.sub(r"([A-Za-z])\{([^{}]+)\}", r"\1_{\2}", cleaned)
+
+    # Trim remaining harmless escape prefixes.
+    cleaned = re.sub(r"\\([A-Za-z]+)", r"\1", cleaned)
+    cleaned = cleaned.replace("{", "(").replace("}", ")")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _replace_latex_command_with_braces(
+    text: str,
+    command_pattern: str,
+    formatter,
+    arg_count: int = 2,
+) -> str:
+    pattern = re.compile(command_pattern)
+    current = text
+
+    while True:
+        match = pattern.search(current)
+        if not match:
+            break
+
+        args: list[str] = []
+        cursor = match.end()
+        success = True
+
+        for _ in range(arg_count):
+            group, cursor = _read_braced_group(current, cursor)
+            if group is None:
+                success = False
+                break
+            args.append(group)
+
+        if not success:
+            break
+
+        replacement = formatter(*args)
+        current = f"{current[:match.start()]}{replacement}{current[cursor:]}"
+
+    return current
+
+
+def _read_braced_group(text: str, start: int) -> tuple[str | None, int]:
+    cursor = start
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+
+    if cursor >= len(text):
+        return None, cursor
+
+    if text[cursor] != "{":
+        return text[cursor], cursor + 1
+
+    depth = 0
+    content_start = cursor + 1
+
+    for index in range(cursor, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[content_start:index], index + 1
+
+    return None, cursor
+
+
+def _format_fraction(numerator: str, denominator: str) -> str:
+    left = _latex_to_plain_text(numerator)
+    right = _latex_to_plain_text(denominator)
+    return f"({left})/({right})"
+
+
+def _format_sqrt(content: str) -> str:
+    inner = _latex_to_plain_text(content)
+    return f"√({inner})"
+
+
+def _format_text(content: str) -> str:
+    return _latex_to_plain_text(content)
 
 
 def _ensure_fonts() -> None:

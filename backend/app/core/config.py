@@ -16,7 +16,11 @@ class AppConfig:
     app_version: str = "0.1.0"
     api_prefix: str = "/api/v1"
     data_dir: str = str(DATA_DIR)
-    cache_dir: str = str(DATA_DIR / "cache")
+    legacy_cache_dir: str = str(DATA_DIR / "cache")
+    cache_dir: str = str(DATA_DIR / "cache" / "by_pdf_hash")
+    library_dir: str = str(DATA_DIR / "library")
+    documents_dir: str = str(DATA_DIR / "library" / "documents")
+    documents_index_path: str = str(DATA_DIR / "library" / "documents.json")
     ai_configs_path: str = str(DATA_DIR / "ai_configs.json")
     prompts_path: str = str(DATA_DIR / "prompts.json")
     activity_log_path: str = str(DATA_DIR / "activity_log.jsonl")
@@ -27,7 +31,9 @@ class AppConfig:
 settings = AppConfig()
 
 os.makedirs(settings.data_dir, exist_ok=True)
+os.makedirs(settings.legacy_cache_dir, exist_ok=True)
 os.makedirs(settings.cache_dir, exist_ok=True)
+os.makedirs(settings.library_dir, exist_ok=True)
+os.makedirs(settings.documents_dir, exist_ok=True)
 os.makedirs(settings.exports_dir, exist_ok=True)
 os.makedirs(settings.logs_dir, exist_ok=True)
-

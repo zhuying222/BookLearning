@@ -6,11 +6,13 @@ type Props = {
   locale: 'zh' | 'en'
   disabled: boolean
   activeTask: TaskStatus | null
+  currentPage: number
   rangeInput: string
   onRangeInputChange: (value: string) => void
   onParseRange: (pages: string, force: boolean) => void
   pagePrompt: string
   onPagePromptChange: (value: string) => void
+  configuredPromptCount: number
   onTaskUpdate: (task: TaskStatus | null) => void
   batchPreparationStatus: string
 }
@@ -19,11 +21,13 @@ export default function ParseControls({
   locale,
   disabled,
   activeTask,
+  currentPage,
   rangeInput,
   onRangeInputChange,
   onParseRange,
   pagePrompt,
   onPagePromptChange,
+  configuredPromptCount,
   onTaskUpdate,
   batchPreparationStatus,
 }: Props) {
@@ -68,8 +72,15 @@ export default function ParseControls({
           type="text"
           value={pagePrompt}
           onChange={(e) => onPagePromptChange(e.target.value)}
-          placeholder={isZh ? '页级提示词（可选），如"重点讲解公式"' : 'Page prompt (optional)'}
+          placeholder={isZh ? `第 ${currentPage} 页提示词（可选），如“重点讲解公式”` : `Prompt for page ${currentPage} (optional)`}
         />
+      </div>
+      <div className="ctrl-status">
+        <span>
+          {isZh
+            ? `当前输入仅对应第 ${currentPage} 页。批量解析时会按页分别使用已设置的提示词，已设置 ${configuredPromptCount} 页。`
+            : `This input only applies to page ${currentPage}. Batch parsing uses saved prompts page by page. Configured pages: ${configuredPromptCount}.`}
+        </span>
       </div>
 
       {/* 批量解析 */}

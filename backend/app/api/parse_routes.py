@@ -166,21 +166,7 @@ async def save_edited(pdf_hash: str, page_number: int, body: dict):
 
 @router.get("/cache/{pdf_hash}")
 async def get_all_cached(pdf_hash: str):
-    """获取某 PDF 所有已缓存页的讲解结果。"""
-    from pathlib import Path
-    cache_dir = Path(cache_service.settings.cache_dir) / pdf_hash
-    if not cache_dir.exists():
-        return {"pdf_hash": pdf_hash, "pages": {}, "page_costs": {}}
-    results: dict[int, str] = {}
-    page_costs: dict[int, dict] = {}
-    for f in sorted(cache_dir.glob("page_*.json")):
-        import json
-        data = json.loads(f.read_text(encoding="utf-8"))
-        page_num = data.get("page_number")
-        if page_num is not None and page_num not in results:
-            results[page_num] = data.get("explanation", "")
-            if isinstance(data.get("cost_info"), dict):
-                page_costs[page_num] = data["cost_info"]
+    results, page_costs = cache_service.get_all_cached_pages(pdf_hash)
     return {"pdf_hash": pdf_hash, "pages": results, "page_costs": page_costs}
 
 

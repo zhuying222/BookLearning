@@ -1,14 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, ChangeEvent, KeyboardEvent as ReactKeyboardEvent, WheelEvent } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, WheelEvent } from 'react'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 
 import './App.css'
 import AiConfigPanel from './components/AiConfigPanel'
+import Bookshelf from './components/Bookshelf'
 import ExplanationPanel from './components/ExplanationPanel'
 import ParseControls from './components/ParseControls'
 import PromptEditor from './components/PromptEditor'
-import type { TaskStatus } from './lib/api'
-import { getTaskStatus, loadAllCachedExplanations, parseRange, parseSinglePage } from './lib/api'
+import type { LibraryDocument, TaskStatus } from './lib/api'
+import {
+  deleteDocument,
+  downloadDocumentPdf,
+  getTaskStatus,
+  importDocument,
+  listDocuments,
+  loadAllCachedExplanations,
+  parseRange,
+  parseSinglePage,
+  updateDocumentProgress,
+} from './lib/api'
 import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
 import {
@@ -17,16 +28,17 @@ import {
   renderPdfPageToDataUrl,
 } from './lib/pdf'
 
-const MIN_SCALE = 0.75
-const MAX_SCALE = 2.2
+const MIN_SCALE = 0.4
+const MAX_SCALE = 4
 const DEFAULT_SCALE = 1.1
 const DEFAULT_EXPORT_SCALE = 1.75
-const MIN_VIEWER_RATIO = 40
-const MAX_VIEWER_RATIO = 70
-const MIN_RIGHT_TOP_RATIO = 55
-const MAX_RIGHT_TOP_RATIO = 80
+const MIN_VIEWER_RATIO = 12
+const MAX_VIEWER_RATIO = 88
+const MIN_RIGHT_TOP_RATIO = 18
+const MAX_RIGHT_TOP_RATIO = 92
 
 type Locale = 'zh' | 'en'
+type ViewMode = 'library' | 'reader'
 
 type StatusState =
   | { key: 'idle' }
@@ -41,7 +53,7 @@ type StatusState =
 function getStatusText(locale: Locale, status: StatusState): string {
   switch (status.key) {
     case 'idle':
-      return locale === 'zh' ? '加载本地 PDF 后即可开始阅读。' : 'Load a local PDF to start reading.'
+      return locale === 'zh' ? '从书架中选择一本 PDF 后即可开始阅读。' : 'Select a PDF from your shelf to start reading.'
     case 'loadingPdf':
       return locale === 'zh' ? `正在加载 ${status.fileName}...` : `Loading ${status.fileName}...`
     case 'renderingPage':
@@ -63,14 +75,15 @@ function getStatusText(locale: Locale, status: StatusState): string {
   }
 }
 
-async function computePdfHash(data: Uint8Array): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data.slice())
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 24)
-}
-
 function App() {
   const [locale, setLocale] = useState<Locale>('zh')
+  const [viewMode, setViewMode] = useState<ViewMode>('library')
+  const [libraryDocuments, setLibraryDocuments] = useState<LibraryDocument[]>([])
+  const [isLibraryLoading, setIsLibraryLoading] = useState(true)
+  const [isImportingDocument, setIsImportingDocument] = useState(false)
+  const [libraryError, setLibraryError] = useState('')
+  const [libraryActionMessage, setLibraryActionMessage] = useState('')
+  const [currentDocumentMeta, setCurrentDocumentMeta] = useState<LibraryDocument | null>(null)
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
   const [pdfFileName, setPdfFileName] = useState('No file loaded')
   const [pdfHash, setPdfHash] = useState('')
@@ -91,12 +104,12 @@ function App() {
   const [showAiConfig, setShowAiConfig] = useState(false)
   const [showPromptEditor, setShowPromptEditor] = useState(false)
   const [explanations, setExplanations] = useState<Record<number, string>>({})
-  const [isParsingPage, setIsParsingPage] = useState(false)
+  const [parsingPages, setParsingPages] = useState<number[]>([])
   const [parseError, setParseError] = useState('')
   const [activeTask, setActiveTask] = useState<TaskStatus | null>(null)
   const [batchRangeInput, setBatchRangeInput] = useState('')
   const [batchPreparationStatus, setBatchPreparationStatus] = useState('')
-  const [pagePrompt, setPagePrompt] = useState('')
+  const [pagePrompts, setPagePrompts] = useState<Record<number, string>>({})
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState('')
   const [exportAllPages, setExportAllPages] = useState(false)
@@ -106,24 +119,65 @@ function App() {
   const viewerRef = useRef<HTMLDivElement | null>(null)
   const splitLayoutRef = useRef<HTMLDivElement | null>(null)
   const rightPanelRef = useRef<HTMLElement | null>(null)
-  const pdfBytesRef = useRef<Uint8Array | null>(null)
   const taskPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const documentLoadSeqRef = useRef(0)
 
   const isZh = locale === 'zh'
   const statusText = useMemo(() => getStatusText(locale, status), [locale, status])
-  const displayFileName = pdfDocument ? pdfFileName : (isZh ? '未载入文件' : 'No file loaded')
+  const displayFileName = currentDocumentMeta?.original_file_name ?? (isZh ? '未选择文档' : 'No document selected')
   const selectedBatchPages = useMemo(
     () => parsePageSelection(batchRangeInput, pageCount),
     [batchRangeInput, pageCount],
   )
   const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
+  const currentPagePrompt = pagePrompts[currentPage] ?? ''
+  const configuredPromptCount = useMemo(
+    () => Object.values(pagePrompts).filter((value) => value.trim()).length,
+    [pagePrompts],
+  )
+  const isCurrentPageParsing = parsingPages.includes(currentPage)
+
+  const syncDocumentIntoShelf = useCallback((document: LibraryDocument) => {
+    setCurrentDocumentMeta(document)
+    setLibraryDocuments((prev) => {
+      const withoutTarget = prev.filter((item) => item.id !== document.id)
+      return [document, ...withoutTarget]
+    })
+  }, [])
+
+  const refreshLibraryDocuments = useCallback(async (silent = false) => {
+    if (!silent) {
+      setIsLibraryLoading(true)
+    }
+    setLibraryError('')
+    try {
+      const documents = await listDocuments()
+      setLibraryDocuments(documents)
+      setCurrentDocumentMeta((prev) => {
+        if (!prev) return prev
+        return documents.find((document) => document.id === prev.id) ?? prev
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load library.'
+      setLibraryError(message)
+    } finally {
+      if (!silent) {
+        setIsLibraryLoading(false)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     document.title = isZh ? 'BookLearning 阅读器' : 'BookLearning Reader'
   }, [isZh])
 
   useEffect(() => {
+    void refreshLibraryDocuments()
+  }, [refreshLibraryDocuments])
+
+  useEffect(() => {
     return () => {
+      documentLoadSeqRef.current += 1
       if (activeDocumentRef.current) {
         void activeDocumentRef.current.destroy()
       }
@@ -133,6 +187,18 @@ function App() {
   useEffect(() => {
     setJumpInput(String(currentPage))
   }, [currentPage])
+
+  useEffect(() => {
+    if (viewMode !== 'reader' || !currentDocumentMeta || pageCount === 0) return
+    const timeout = window.setTimeout(() => {
+      void updateDocumentProgress(currentDocumentMeta.id, currentPage)
+        .then((updated) => {
+          syncDocumentIntoShelf(updated)
+        })
+        .catch(() => { /* ignore progress sync errors */ })
+    }, 800)
+    return () => window.clearTimeout(timeout)
+  }, [currentDocumentMeta, currentPage, pageCount, syncDocumentIntoShelf, viewMode])
 
   // Resize splitter
   useEffect(() => {
@@ -171,7 +237,7 @@ function App() {
 
   // Render current page
   useEffect(() => {
-    if (!pdfDocument || !canvasRef.current || pageCount === 0) return
+    if (viewMode !== 'reader' || !pdfDocument || !canvasRef.current || pageCount === 0) return
     let cancelled = false
     const renderCurrentPage = async () => {
       setRenderError('')
@@ -197,12 +263,12 @@ function App() {
     }
     void renderCurrentPage()
     return () => { cancelled = true }
-  }, [currentPage, pageCount, pdfDocument, pdfFileName, scale])
+  }, [currentPage, pageCount, pdfDocument, pdfFileName, scale, viewMode])
 
   // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!pdfDocument || pageCount === 0) return
+      if (viewMode !== 'reader' || !pdfDocument || pageCount === 0) return
       const target = event.target as HTMLElement | null
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) return
 
@@ -222,7 +288,7 @@ function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [pageCount, pdfDocument])
+  }, [pageCount, pdfDocument, viewMode])
 
   // Poll active task
   useEffect(() => {
@@ -263,53 +329,168 @@ function App() {
     }
   }, [activeTask?.task_id, activeTask?.status])
 
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const [file] = Array.from(event.target.files ?? [])
-    if (!file) return
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      setLoadError(isZh ? '请选择 PDF 文件。' : 'Please choose a PDF file.')
-      return
-    }
+  const openLibraryDocument = useCallback(async (document: LibraryDocument) => {
+    const requestSeq = documentLoadSeqRef.current + 1
+    documentLoadSeqRef.current = requestSeq
+
+    setViewMode('reader')
+    setCurrentDocumentMeta(document)
     setIsLoadingPdf(true)
     setLoadError('')
     setRenderError('')
     setParseError('')
     setExplanations({})
+    setParsingPages([])
+    setPagePrompts({})
     setActiveTask(null)
-    setStatus({ key: 'loadingPdf', fileName: file.name })
+    setBatchRangeInput('')
+    setBatchPreparationStatus('')
+    setExportProgress('')
+    setPdfDocument(null)
+    setPdfHash(document.pdf_hash)
+    setPdfFileName(document.original_file_name)
+    setPageCount(0)
+    setCurrentPage(1)
+    setJumpInput(String(document.last_read_page || 1))
+    setScale(DEFAULT_SCALE)
+    setStatus({ key: 'loadingPdf', fileName: document.original_file_name })
+    setLibraryError('')
+    setLibraryActionMessage('')
+
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer())
-      pdfBytesRef.current = bytes
-      const hash = await computePdfHash(bytes)
-      setPdfHash(hash)
+      const bytes = await downloadDocumentPdf(document.id)
+      if (requestSeq !== documentLoadSeqRef.current) return
+
       const nextDocument = await loadPdfDocument(bytes)
+      if (requestSeq !== documentLoadSeqRef.current) {
+        await nextDocument.destroy()
+        return
+      }
+
       if (activeDocumentRef.current) await activeDocumentRef.current.destroy()
       activeDocumentRef.current = nextDocument
       setPdfDocument(nextDocument)
-      setPdfFileName(file.name)
-      setPageCount(nextDocument.numPages)
-      setCurrentPage(1)
-      setJumpInput('1')
-      setScale(DEFAULT_SCALE)
-      // 加载已缓存的讲解结果
-      loadAllCachedExplanations(hash).then((data) => {
-        if (data.pages && Object.keys(data.pages).length > 0) {
-          const mapped: Record<number, string> = {}
-          for (const [k, v] of Object.entries(data.pages)) {
-            mapped[Number(k)] = v
-          }
-          setExplanations(mapped)
+
+      const nextPageCount = nextDocument.numPages
+      const nextPage = clamp(document.last_read_page || 1, 1, nextPageCount)
+      const openedDocument: LibraryDocument = {
+        ...document,
+        page_count: nextPageCount,
+        last_read_page: nextPage,
+        last_opened_at: new Date().toISOString(),
+      }
+
+      setPageCount(nextPageCount)
+      setCurrentPage(nextPage)
+      setJumpInput(String(nextPage))
+      syncDocumentIntoShelf(openedDocument)
+
+      const cached = await loadAllCachedExplanations(document.pdf_hash).catch(() => null)
+      if (requestSeq !== documentLoadSeqRef.current || !cached) return
+
+      if (cached.pages && Object.keys(cached.pages).length > 0) {
+        const mapped: Record<number, string> = {}
+        for (const [k, v] of Object.entries(cached.pages)) {
+          mapped[Number(k)] = v
         }
-      }).catch(() => { /* 无缓存忽略 */ })
+        setExplanations(mapped)
+      }
     } catch (error) {
+      if (requestSeq !== documentLoadSeqRef.current) return
       const message = error instanceof Error ? error.message : 'Failed to load the PDF file.'
       setLoadError(message)
       setStatus({ key: 'renderFailed' })
+      setViewMode('library')
+      setLibraryError(message)
     } finally {
-      setIsLoadingPdf(false)
-      event.target.value = ''
+      if (requestSeq === documentLoadSeqRef.current) {
+        setIsLoadingPdf(false)
+      }
     }
-  }
+  }, [syncDocumentIntoShelf])
+
+  const handleImportLibraryDocument = useCallback(async (file: File) => {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setLibraryError(isZh ? '请选择 PDF 文件。' : 'Please choose a PDF file.')
+      return
+    }
+
+    setIsImportingDocument(true)
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const result = await importDocument(file)
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        result.created
+          ? (isZh ? `已导入《${result.document.title}》到书架。` : `Imported "${result.document.title}" to your shelf.`)
+          : (isZh ? `《${result.document.title}》已经在书架中了。` : `"${result.document.title}" is already on the shelf.`),
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to import PDF.'
+      setLibraryError(message)
+    } finally {
+      setIsImportingDocument(false)
+    }
+  }, [isZh, refreshLibraryDocuments])
+
+  const handleDeleteLibraryDocument = useCallback(async (document: LibraryDocument, removeCache: boolean) => {
+    const confirmed = window.confirm(
+      removeCache
+        ? (isZh
+            ? `删除《${document.title}》并清除该 PDF 的缓存讲解？`
+            : `Delete "${document.title}" and remove its cached explanations?`)
+        : (isZh
+            ? `将《${document.title}》移出书架，但保留缓存讲解？`
+            : `Remove "${document.title}" from the shelf but keep its cached explanations?`),
+    )
+    if (!confirmed) return
+
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      await deleteDocument(document.id, removeCache)
+      await refreshLibraryDocuments(true)
+      if (currentDocumentMeta?.id === document.id) {
+        if (activeDocumentRef.current) {
+          void activeDocumentRef.current.destroy()
+          activeDocumentRef.current = null
+        }
+        setCurrentDocumentMeta(null)
+        setPdfDocument(null)
+        setPdfHash('')
+        setPdfFileName('No file loaded')
+        setPageCount(0)
+        setCurrentPage(1)
+        setJumpInput('1')
+        setExplanations({})
+        setParsingPages([])
+        setPagePrompts({})
+        setActiveTask(null)
+        setStatus({ key: 'idle' })
+      }
+      setLibraryActionMessage(
+        removeCache
+          ? (isZh ? `已删除《${document.title}》及其缓存。` : `Deleted "${document.title}" and its cache.`)
+          : (isZh ? `已将《${document.title}》移出书架，缓存已保留。` : `Removed "${document.title}" from the shelf and kept cache.`),
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to delete document.'
+      setLibraryError(message)
+    }
+  }, [currentDocumentMeta?.id, isZh, refreshLibraryDocuments])
+
+  const handleBackToLibrary = useCallback(() => {
+    setViewMode('library')
+    if (currentDocumentMeta && pageCount > 0) {
+      void updateDocumentProgress(currentDocumentMeta.id, currentPage)
+        .then((updated) => {
+          syncDocumentIntoShelf(updated)
+        })
+        .catch(() => { /* ignore progress sync errors */ })
+    }
+    void refreshLibraryDocuments(true)
+  }, [currentDocumentMeta, currentPage, pageCount, refreshLibraryDocuments, syncDocumentIntoShelf])
 
   const goToPage = (pageNumber: number) => {
     if (!pdfDocument || pageCount === 0) return
@@ -337,29 +518,32 @@ function App() {
 
   const handleParseCurrent = useCallback(async () => {
     if (!pdfDocument || !pdfHash) return
-    setIsParsingPage(true)
+    const pageToParse = currentPage
+    if (parsingPages.includes(pageToParse)) return
+
+    setParsingPages((prev) => [...prev, pageToParse])
     setParseError('')
-    setStatus({ key: 'parsing', page: currentPage })
+    setStatus({ key: 'parsing', page: pageToParse })
     try {
-      const image = await renderPdfPageToDataUrl(pdfDocument, currentPage, DEFAULT_EXPORT_SCALE)
+      const image = await renderPdfPageToDataUrl(pdfDocument, pageToParse, DEFAULT_EXPORT_SCALE)
       const base64 = image.dataUrl.replace(/^data:image\/png;base64,/, '')
       const result = await parseSinglePage({
         pdf_hash: pdfHash,
-        page_number: currentPage,
+        page_number: pageToParse,
         image_base64: base64,
-        page_prompt: pagePrompt || undefined,
+        page_prompt: currentPagePrompt.trim() || undefined,
         force: false,
       })
-      setExplanations((prev) => ({ ...prev, [currentPage]: result.explanation }))
-      setStatus({ key: 'parsed', page: currentPage })
+      setExplanations((prev) => ({ ...prev, [pageToParse]: result.explanation }))
+      setStatus({ key: 'parsed', page: pageToParse })
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Parse failed'
       setParseError(msg)
       setStatus({ key: 'parseFailed', error: msg })
     } finally {
-      setIsParsingPage(false)
+      setParsingPages((prev) => prev.filter((page) => page !== pageToParse))
     }
-  }, [pdfDocument, pdfHash, currentPage, pagePrompt])
+  }, [pdfDocument, pdfHash, currentPage, currentPagePrompt, parsingPages])
 
   const handleParseRange = useCallback(async (rangeStr: string, force: boolean) => {
     if (!pdfDocument || !pdfHash) return
@@ -382,17 +566,16 @@ function App() {
             : `Preparing batch task ${index + 1}/${pages.length}...`,
         )
       }
-      const pagePrompts: Record<number, string> = {}
-      if (pagePrompt) {
-        for (const p of pages) {
-          pagePrompts[p] = pagePrompt
-        }
-      }
+      const selectedPagePrompts = Object.fromEntries(
+        pages
+          .map((page) => [page, pagePrompts[page]?.trim() ?? ''] as const)
+          .filter(([, prompt]) => prompt),
+      )
       const task = await parseRange({
         pdf_hash: pdfHash,
         pages,
         images_base64: imagesBase64,
-        page_prompts: Object.keys(pagePrompts).length > 0 ? pagePrompts : undefined,
+        page_prompts: Object.keys(selectedPagePrompts).length > 0 ? selectedPagePrompts : undefined,
         force,
       })
       setActiveTask(task)
@@ -402,7 +585,26 @@ function App() {
       setParseError(msg)
       setBatchPreparationStatus('')
     }
-  }, [pdfDocument, pdfHash, pageCount, pagePrompt, isZh])
+  }, [pdfDocument, pdfHash, pageCount, pagePrompts, isZh])
+
+  const handleCurrentPagePromptChange = useCallback((value: string) => {
+    setPagePrompts((prev) => {
+      const trimmed = value.trim()
+      if (!trimmed) {
+        if (!(currentPage in prev)) {
+          return prev
+        }
+        const next = { ...prev }
+        delete next[currentPage]
+        return next
+      }
+
+      return {
+        ...prev,
+        [currentPage]: value,
+      }
+    })
+  }, [currentPage])
 
   const handleToggleCurrentPageInBatch = useCallback((checked: boolean) => {
     if (pageCount === 0) return
@@ -463,25 +665,33 @@ function App() {
       {showAiConfig && <AiConfigPanel locale={locale} onClose={() => setShowAiConfig(false)} />}
       {showPromptEditor && <PromptEditor locale={locale} onClose={() => setShowPromptEditor(false)} />}
 
-      {/* ====== Top Toolbar ====== */}
       <header className="top-bar">
         <div className="top-bar-left">
           <span className="top-bar-brand">BookLearning</span>
-          <label className="top-bar-file-btn">
-            <input type="file" accept="application/pdf,.pdf" onChange={handleFileChange} hidden />
-            {isZh ? '打开 PDF' : 'Open PDF'}
-          </label>
-          <span className="top-bar-filename">{displayFileName}</span>
+          {viewMode === 'reader' ? (
+            <>
+              <button type="button" className="top-bar-btn" onClick={handleBackToLibrary}>
+                {isZh ? '返回书架' : 'Back to shelf'}
+              </button>
+              <span className="top-bar-filename">{displayFileName}</span>
+            </>
+          ) : (
+            <span className="top-bar-library-tag">{isZh ? '本地书架' : 'Local shelf'}</span>
+          )}
         </div>
         <div className="top-bar-right">
-          <span className="top-bar-page-info">
-            {pageCount > 0 && (isZh ? `${currentPage} / ${pageCount} 页` : `${currentPage} / ${pageCount}`)}
-          </span>
-          <div className="top-bar-zoom">
-            <button type="button" onClick={() => changeScale(-0.1)} disabled={!pdfDocument || scale <= MIN_SCALE}>-</button>
-            <span>{Math.round(scale * 100)}%</span>
-            <button type="button" onClick={() => changeScale(0.1)} disabled={!pdfDocument || scale >= MAX_SCALE}>+</button>
-          </div>
+          {viewMode === 'reader' && (
+            <>
+              <span className="top-bar-page-info">
+                {pageCount > 0 && (isZh ? `${currentPage} / ${pageCount} 页` : `${currentPage} / ${pageCount}`)}
+              </span>
+              <div className="top-bar-zoom">
+                <button type="button" onClick={() => changeScale(-0.1)} disabled={!pdfDocument || scale <= MIN_SCALE}>-</button>
+                <span>{Math.round(scale * 100)}%</span>
+                <button type="button" onClick={() => changeScale(0.1)} disabled={!pdfDocument || scale >= MAX_SCALE}>+</button>
+              </div>
+            </>
+          )}
           <button type="button" className="top-bar-btn" onClick={() => setShowAiConfig(true)}>
             {isZh ? 'AI 配置' : 'AI Config'}
           </button>
@@ -495,157 +705,163 @@ function App() {
         </div>
       </header>
 
-      {/* ====== Main Split Layout ====== */}
-      <main
-        ref={splitLayoutRef}
-        className={`main-layout${isResizing ? ' main-layout--resizing' : ''}`}
-        style={{ gridTemplateColumns: `${viewerRatio}fr 8px ${100 - viewerRatio}fr` }}
-      >
-        {/* ---- Left: PDF Viewer ---- */}
-        <section className="viewer-pane">
-          <div className="viewer-toolbar">
-            <span>{displayFileName}</span>
-            <span>
-              {isZh
-                ? `第 ${currentPage} / ${pageCount || 0} 页`
-                : `Page ${currentPage} / ${pageCount || 0}`}
-            </span>
-          </div>
-          <div ref={viewerRef} className="single-page-stage" onWheel={handleViewerWheel}>
-            {pageCount === 0 ? (
-              <div className="empty-reader">
-                <p>{isZh ? '打开本地 PDF 后，这里将显示当前页。' : 'Open a local PDF to see the current page.'}</p>
-              </div>
-            ) : (
-              <div className="single-page-card">
-                <canvas ref={canvasRef} className="pdf-canvas" />
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* ---- Splitter ---- */}
-        <div
-          className="splitter"
-          role="separator"
-          aria-orientation="vertical"
-          onPointerDown={() => setIsResizing(true)}
+      {viewMode === 'library' ? (
+        <Bookshelf
+          locale={locale}
+          documents={libraryDocuments}
+          currentDocumentId={currentDocumentMeta?.id ?? null}
+          loading={isLibraryLoading}
+          importing={isImportingDocument}
+          error={libraryError}
+          actionMessage={libraryActionMessage}
+          onImport={handleImportLibraryDocument}
+          onOpen={(document) => { void openLibraryDocument(document) }}
+          onDelete={handleDeleteLibraryDocument}
         />
-
-        {/* ---- Right: Explanation + Controls with draggable split ---- */}
-        <aside
-          ref={rightPanelRef}
-          className={`right-panel${isRightPanelResizing ? ' right-panel--resizing' : ''}`}
-          style={
-            {
-              '--right-top-size': `${rightTopRatio}fr`,
-              '--right-bottom-size': `${100 - rightTopRatio}fr`,
-            } as CSSProperties
-          }
+      ) : (
+        <main
+          ref={splitLayoutRef}
+          className={`main-layout${isResizing ? ' main-layout--resizing' : ''}`}
+          style={{ gridTemplateColumns: `${viewerRatio}fr 8px ${100 - viewerRatio}fr` }}
         >
-          {/* Explanation area - takes 2/3 */}
-          <div className="right-top">
-            <ExplanationPanel
-              locale={locale}
-              currentPage={currentPage}
-              explanations={explanations}
-              isLoading={isParsingPage}
-              pageCount={pageCount}
-              pdfHash={pdfHash}
-              onExplanationUpdate={(page, text) => setExplanations((prev) => ({ ...prev, [page]: text }))}
-            />
-          </div>
+          <section className="viewer-pane">
+            <div className="viewer-toolbar">
+              <span>{displayFileName}</span>
+              <span>
+                {isZh
+                  ? `第 ${currentPage} / ${pageCount || 0} 页`
+                  : `Page ${currentPage} / ${pageCount || 0}`}
+              </span>
+            </div>
+            <div ref={viewerRef} className="single-page-stage" onWheel={handleViewerWheel}>
+              {pageCount === 0 ? (
+                <div className="empty-reader">
+                  <p>{isZh ? '正在从本地书架载入 PDF...' : 'Loading PDF from your local shelf...'}</p>
+                </div>
+              ) : (
+                <div className="single-page-card">
+                  <canvas ref={canvasRef} className="pdf-canvas" />
+                </div>
+              )}
+            </div>
+          </section>
 
           <div
-            className="right-splitter"
+            className="splitter"
             role="separator"
-            aria-orientation="horizontal"
-            onPointerDown={() => setIsRightPanelResizing(true)}
+            aria-orientation="vertical"
+            onPointerDown={() => setIsResizing(true)}
           />
 
-          {/* Controls area - takes 1/3 */}
-          <div className="right-bottom">
-            {/* Page navigation row */}
-            <div className="ctrl-row">
-              <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage - 1)} disabled={!pdfDocument || currentPage <= 1}>
-                {isZh ? '上一页' : 'Prev'}
-              </button>
-              <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage + 1)} disabled={!pdfDocument || currentPage >= pageCount}>
-                {isZh ? '下一页' : 'Next'}
-              </button>
-              <label className="ctrl-check">
-                <input
-                  type="checkbox"
-                  checked={isCurrentPageInBatch}
-                  onChange={(e) => handleToggleCurrentPageInBatch(e.target.checked)}
-                  disabled={!pdfDocument}
-                />
-                {isZh ? '加入批量' : 'Batch'}
-              </label>
-              <button type="button" className="ctrl-btn ctrl-btn--primary" onClick={handleParseCurrent} disabled={!pdfDocument || isParsingPage}>
-                {isParsingPage ? (isZh ? '解析中...' : 'Parsing...') : (isZh ? '解析当前页' : 'Parse page')}
-              </button>
+          <aside
+            ref={rightPanelRef}
+            className={`right-panel${isRightPanelResizing ? ' right-panel--resizing' : ''}`}
+            style={
+              {
+                '--right-top-size': `${rightTopRatio}fr`,
+                '--right-bottom-size': `${100 - rightTopRatio}fr`,
+              } as CSSProperties
+            }
+          >
+            <div className="right-top">
+              <ExplanationPanel
+                locale={locale}
+                currentPage={currentPage}
+                explanations={explanations}
+                isLoading={isCurrentPageParsing}
+                pageCount={pageCount}
+                pdfHash={pdfHash}
+                onExplanationUpdate={(page, text) => setExplanations((prev) => ({ ...prev, [page]: text }))}
+              />
             </div>
 
-            {/* Jump to page */}
-            <div className="ctrl-row">
-              <label className="ctrl-label">{isZh ? '跳转' : 'Go to'}</label>
-              <input className="ctrl-input" type="text" value={jumpInput} onChange={(e) => setJumpInput(e.target.value)} onKeyDown={handleJumpKeyDown} placeholder="12" />
-              <button type="button" className="ctrl-btn" onClick={handleJumpSubmit} disabled={!pdfDocument}>{isZh ? '跳转' : 'Go'}</button>
-            </div>
-
-            {/* Batch parse range */}
-            <ParseControls
-              locale={locale}
-              disabled={!pdfDocument}
-              activeTask={activeTask}
-              rangeInput={batchRangeInput}
-              onRangeInputChange={setBatchRangeInput}
-              onParseRange={handleParseRange}
-              pagePrompt={pagePrompt}
-              onPagePromptChange={setPagePrompt}
-              onTaskUpdate={setActiveTask}
-              batchPreparationStatus={batchPreparationStatus}
+            <div
+              className="right-splitter"
+              role="separator"
+              aria-orientation="horizontal"
+              onPointerDown={() => setIsRightPanelResizing(true)}
             />
 
-            {/* Export row */}
-            <div className="ctrl-row">
-              <button type="button" className="ctrl-btn" onClick={handleExportJson} disabled={!hasExplanations || isExporting}>
-                {isZh ? '导出数据' : 'Export JSON'}
-              </button>
-              <button type="button" className="ctrl-btn" onClick={handleExportHtml} disabled={!hasExplanations || isExporting}>
-                {isZh ? '导出 HTML' : 'Export HTML'}
-              </button>
-              <button type="button" className="ctrl-btn" onClick={handleExportPdf} disabled={!hasExplanations || isExporting}>
-                {isZh ? '导出 PDF' : 'Export PDF'}
-              </button>
-              <label className="ctrl-check">
-                <input type="checkbox" checked={exportAllPages} onChange={(e) => setExportAllPages(e.target.checked)} disabled={!pdfDocument} />
-                {isZh ? '含全部页' : 'All pages'}
-              </label>
-            </div>
+            <div className="right-bottom">
+              <div className="ctrl-row">
+                <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage - 1)} disabled={!pdfDocument || currentPage <= 1}>
+                  {isZh ? '上一页' : 'Prev'}
+                </button>
+                <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage + 1)} disabled={!pdfDocument || currentPage >= pageCount}>
+                  {isZh ? '下一页' : 'Next'}
+                </button>
+                <label className="ctrl-check">
+                  <input
+                    type="checkbox"
+                    checked={isCurrentPageInBatch}
+                    onChange={(e) => handleToggleCurrentPageInBatch(e.target.checked)}
+                    disabled={!pdfDocument}
+                  />
+                  {isZh ? '加入批量' : 'Batch'}
+                </label>
+                <button type="button" className="ctrl-btn ctrl-btn--primary" onClick={handleParseCurrent} disabled={!pdfDocument || isCurrentPageParsing}>
+                  {isCurrentPageParsing ? (isZh ? '解析中...' : 'Parsing...') : (isZh ? '解析当前页' : 'Parse page')}
+                </button>
+              </div>
 
-            {exportProgress && (
+              <div className="ctrl-row">
+                <label className="ctrl-label">{isZh ? '跳转' : 'Go to'}</label>
+                <input className="ctrl-input" type="text" value={jumpInput} onChange={(e) => setJumpInput(e.target.value)} onKeyDown={handleJumpKeyDown} placeholder="12" />
+                <button type="button" className="ctrl-btn" onClick={handleJumpSubmit} disabled={!pdfDocument}>{isZh ? '跳转' : 'Go'}</button>
+              </div>
+
+              <ParseControls
+                locale={locale}
+                disabled={!pdfDocument}
+                activeTask={activeTask}
+                currentPage={currentPage}
+                rangeInput={batchRangeInput}
+                onRangeInputChange={setBatchRangeInput}
+                onParseRange={handleParseRange}
+                pagePrompt={currentPagePrompt}
+                onPagePromptChange={handleCurrentPagePromptChange}
+                configuredPromptCount={configuredPromptCount}
+                onTaskUpdate={setActiveTask}
+                batchPreparationStatus={batchPreparationStatus}
+              />
+
+              <div className="ctrl-row">
+                <button type="button" className="ctrl-btn" onClick={handleExportJson} disabled={!hasExplanations || isExporting}>
+                  {isZh ? '导出数据' : 'Export JSON'}
+                </button>
+                <button type="button" className="ctrl-btn" onClick={handleExportHtml} disabled={!hasExplanations || isExporting}>
+                  {isZh ? '导出 HTML' : 'Export HTML'}
+                </button>
+                <button type="button" className="ctrl-btn" onClick={handleExportPdf} disabled={!hasExplanations || isExporting}>
+                  {isZh ? '导出 PDF' : 'Export PDF'}
+                </button>
+                <label className="ctrl-check">
+                  <input type="checkbox" checked={exportAllPages} onChange={(e) => setExportAllPages(e.target.checked)} disabled={!pdfDocument} />
+                  {isZh ? '含全部页' : 'All pages'}
+                </label>
+              </div>
+
+              {exportProgress && (
+                <div className="ctrl-status">
+                  <span>{exportProgress}</span>
+                </div>
+              )}
+
               <div className="ctrl-status">
-                <span>{exportProgress}</span>
+                <span>{isLoadingPdf ? getStatusText(locale, { key: 'loadingPdf', fileName: pdfFileName }) : statusText}</span>
               </div>
-            )}
 
-            {/* Status line */}
-            <div className="ctrl-status">
-              <span>{isLoadingPdf ? getStatusText(locale, { key: 'loadingPdf', fileName: pdfFileName }) : statusText}</span>
+              {(loadError || renderError || parseError) && (
+                <div className="ctrl-error">
+                  {loadError && <p>{loadError}</p>}
+                  {renderError && <p>{renderError}</p>}
+                  {parseError && <p>{parseError}</p>}
+                </div>
+              )}
             </div>
-
-            {(loadError || renderError || parseError) && (
-              <div className="ctrl-error">
-                {loadError && <p>{loadError}</p>}
-                {renderError && <p>{renderError}</p>}
-                {parseError && <p>{parseError}</p>}
-              </div>
-            )}
-          </div>
-        </aside>
-      </main>
+          </aside>
+        </main>
+      )}
     </div>
   )
 }

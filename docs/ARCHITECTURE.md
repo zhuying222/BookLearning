@@ -27,8 +27,17 @@
 
 ### 本地存储
 
-第一阶段：
-- `JSON` 文件存储项目配置与讲解结果
+当前实现：
+- `data/library/documents.json`
+  - 维护已导入 PDF 的索引、阅读进度、最近打开时间
+- `data/library/documents/<document_id>/source.pdf`
+  - 存放受应用管理的本地 PDF 副本
+- `data/cache/by_pdf_hash/<pdf_hash>/`
+  - 存放按 PDF 内容哈希隔离的页级讲解缓存
+
+兼容策略：
+- 旧版 `data/cache/<pdf_hash>/` 仍可读取
+- 新写入统一落到 `data/cache/by_pdf_hash/<pdf_hash>/`
 
 后续可选：
 - `SQLite`
@@ -79,6 +88,7 @@
 
 - 项目名称
 - 源 PDF 路径
+- 本地文档库 `document_id`
 - 当前使用的 AI 配置
 - 全局提示词
 - 页级任务状态
@@ -128,4 +138,3 @@
 
 - 阅读器、配置中心、AI 调度自己做
 - 双栏导出重点借鉴 `PDF2ZH` 的输出思路
-

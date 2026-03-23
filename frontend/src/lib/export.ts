@@ -1,31 +1,44 @@
-import { marked } from 'marked'
-import { toPng } from 'html-to-image'
-import katex from 'katex'
 import katexCssText from 'katex/dist/katex.min.css?inline'
+import { toPng } from 'html-to-image'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 
-import { normalizeMathMarkdown } from './mathMarkdown'
 import { renderPdfPageToDataUrl } from './pdf'
+import { renderExplanationMarkdown } from './renderMarkdown'
 const API_BASE = 'http://localhost:8000/api/v1'
-const FIRST_PAGE_TEXT_CAPACITY = 2400
-const CONTINUATION_COLUMN_CAPACITY = 2200
-const CAPTURE_SHEET_WIDTH = 1400
-const CAPTURE_SHEET_HEIGHT = Math.round((CAPTURE_SHEET_WIDTH * 210) / 297)
+const CAPTURE_HEIGHT_SCALE = 1.2
+const MIN_CAPTURE_HEIGHT = 920
+const MAX_CAPTURE_HEIGHT = 1180
+const SHEET_WIDTH_MULTIPLIER = 2.08
 
 type PageData = {
   pageNum: number
   dataUrl: string
   explanation: string
+  width: number
+  height: number
 }
 
 type ExportSheet = {
   html: string
+  captureWidth: number
+  captureHeight: number
+  pageWidthPt: number
+  pageHeightPt: number
 }
 
 type ContinuationSheet = {
   leftHtml: string
   rightHtml: string
 }
+
+type SheetMetrics = {
+  captureWidth: number
+  captureHeight: number
+  pageWidthPt: number
+  pageHeightPt: number
+}
+
+const MAX_BLOCK_COST = 900
 
 export function exportAsJson(
   pdfHash: string,
@@ -99,10 +112,14 @@ export async function exportAsPdf(
   )
   const total = Math.max(1, pages.length + sheets.length)
   const sheetImagesBase64: string[] = []
+  const sheetPageSizes = sheets.map((sheet) => ({
+    width: sheet.pageWidthPt,
+    height: sheet.pageHeightPt,
+  }))
 
   for (let index = 0; index < sheets.length; index += 1) {
     onProgress?.(pages.length + index, total)
-    sheetImagesBase64.push(await renderSheetToBase64(sheets[index].html))
+    sheetImagesBase64.push(await renderSheetToBase64(sheets[index]))
   }
   onProgress?.(total, total)
 
@@ -117,6 +134,7 @@ export async function exportAsPdf(
         Object.entries(explanations).map(([key, value]) => [String(key), value]),
       ),
       sheet_images_base64: sheetImagesBase64,
+      sheet_page_sizes: sheetPageSizes,
     }),
   })
 
@@ -160,44 +178,85 @@ async function buildSheets(
       pageNum,
       dataUrl: image.dataUrl,
       explanation,
+      width: image.width,
+      height: image.height,
     }
-    allSheets.push(...buildPageSheets(pageData))
+    allSheets.push(...await buildPageSheets(pageData, exportScale))
   }
 
   onProgress?.(pages.length, Math.max(1, pages.length * 2))
   return allSheets
 }
 
-function buildPageSheets(pageData: PageData): ExportSheet[] {
+async function buildPageSheets(pageData: PageData, exportScale: number): Promise<ExportSheet[]> {
   const explanation = pageData.explanation.trim()
+  const metrics = buildSheetMetrics(pageData, exportScale)
 
   if (!explanation) {
-    return [{ html: buildFirstSheet(pageData, '', true) }]
+    return [{
+      html: buildFirstSheet(pageData, '', true),
+      ...metrics,
+    }]
   }
 
-  const chunks = paginateExplanation(explanation)
+  const chunks = await paginateExplanation(pageData, explanation, metrics)
   const sheets: ExportSheet[] = []
 
-  sheets.push({ html: buildFirstSheet(pageData, chunks.firstHtml, false) })
+  sheets.push({
+    html: buildFirstSheet(pageData, chunks.firstHtml, false),
+    ...metrics,
+  })
 
   for (const continuation of chunks.continuations) {
-    sheets.push({ html: buildContinuationSheet(pageData.pageNum, continuation) })
+    sheets.push({
+      html: buildContinuationSheet(pageData.pageNum, continuation),
+      ...metrics,
+    })
   }
 
   return sheets
 }
 
-function paginateExplanation(explanation: string): {
+async function paginateExplanation(
+  pageData: PageData,
+  explanation: string,
+  metrics: SheetMetrics,
+): Promise<{
   firstHtml: string
   continuations: ContinuationSheet[]
-} {
-  const blocks = splitMarkdownBlocks(explanation)
-  const firstBlocks = consumeBlocks(blocks, FIRST_PAGE_TEXT_CAPACITY)
+}> {
+  const blocks = expandBlocksForPagination(normalizeExportBlocks(splitMarkdownBlocks(explanation)))
   const continuations: ContinuationSheet[] = []
+  const firstHost = createMeasurementHost({
+    html: buildFirstSheet(pageData, '', false),
+    ...metrics,
+  })
+  await waitForCaptureReady(firstHost)
+  const firstTarget = firstHost.querySelector('.text-surface')
+  if (!(firstTarget instanceof HTMLElement)) {
+    destroyMeasurementHost(firstHost)
+    throw new Error('Failed to measure first export sheet.')
+  }
+  const firstBlocks = consumeBlocksByHeight(blocks, firstTarget)
+  destroyMeasurementHost(firstHost)
 
   while (blocks.length > 0) {
-    const leftBlocks = consumeBlocks(blocks, CONTINUATION_COLUMN_CAPACITY)
-    const rightBlocks = consumeBlocks(blocks, CONTINUATION_COLUMN_CAPACITY)
+    const continuationHost = createMeasurementHost({
+      html: buildContinuationSheet(pageData.pageNum, { leftHtml: '', rightHtml: '' }),
+      ...metrics,
+    })
+    await waitForCaptureReady(continuationHost)
+    const targets = continuationHost.querySelectorAll('.text-surface')
+    const leftTarget = targets[0]
+    const rightTarget = targets[1]
+    if (!(leftTarget instanceof HTMLElement) || !(rightTarget instanceof HTMLElement)) {
+      destroyMeasurementHost(continuationHost)
+      throw new Error('Failed to measure continuation export sheet.')
+    }
+
+    const leftBlocks = consumeBlocksByHeight(blocks, leftTarget)
+    const rightBlocks = consumeBlocksByHeight(blocks, rightTarget)
+    destroyMeasurementHost(continuationHost)
 
     continuations.push({
       leftHtml: renderBlocks(leftBlocks),
@@ -212,32 +271,144 @@ function paginateExplanation(explanation: string): {
 }
 
 function splitMarkdownBlocks(markdown: string): string[] {
-  return markdown
-    .replace(/\r\n/g, '\n')
-    .split(/\n{2,}/)
-    .map((block) => block.trim())
-    .filter(Boolean)
+  const blocks: string[] = []
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n')
+  const current: string[] = []
+  let inFence = false
+  let fenceMarker = ''
+  let inDisplayMath = false
+
+  const flush = () => {
+    const block = current.join('\n').trim()
+    if (block) {
+      blocks.push(block)
+    }
+    current.length = 0
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+
+    if (!inFence && !inDisplayMath && trimmed === '') {
+      flush()
+      continue
+    }
+
+    current.push(line)
+
+    const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/)
+    if (fenceMatch) {
+      if (!inFence) {
+        inFence = true
+        fenceMarker = fenceMatch[1]
+      } else if (trimmed.startsWith(fenceMarker[0]) && trimmed.length >= fenceMarker.length) {
+        inFence = false
+        fenceMarker = ''
+      }
+    }
+
+    if (!inFence && countUnescapedDoubleDollar(line) % 2 === 1) {
+      inDisplayMath = !inDisplayMath
+    }
+  }
+
+  flush()
+  return blocks
 }
 
-function consumeBlocks(blocks: string[], capacity: number): string[] {
+function normalizeExportBlocks(blocks: string[]): string[] {
+  const normalized: string[] = []
+  let carry = ''
+
+  for (const block of blocks) {
+    const combined = carry ? `${carry}\n\n${block}` : block
+    if (isStickyLeadingBlock(combined)) {
+      carry = combined
+      continue
+    }
+    normalized.push(combined)
+    carry = ''
+  }
+
+  if (carry) {
+    normalized.push(carry)
+  }
+
+  return normalized
+}
+
+function isStickyLeadingBlock(block: string): boolean {
+  const trimmed = block.trim()
+  return trimmed === '---' || /^#{1,6}\s[^\n]+$/.test(trimmed)
+}
+
+function renderBlocks(blocks: string[]): string {
+  if (blocks.length === 0) {
+    return ''
+  }
+
+  return renderExplanationMarkdown(blocks.join('\n\n'))
+}
+
+function expandBlocksForPagination(blocks: string[]): string[] {
+  const expanded: string[] = []
+
+  for (const block of blocks) {
+    expanded.push(...splitLargeBlockForPagination(block))
+  }
+
+  return expanded
+}
+
+function buildSheetMetrics(pageData: PageData, exportScale: number): SheetMetrics {
+  const pageWidthPt = pageData.width / exportScale
+  const pageHeightPt = pageData.height / exportScale
+  const captureHeight = clampNumber(
+    Math.round(pageHeightPt * CAPTURE_HEIGHT_SCALE),
+    MIN_CAPTURE_HEIGHT,
+    MAX_CAPTURE_HEIGHT,
+  )
+  const captureWidth = Math.round(captureHeight * (pageWidthPt / pageHeightPt) * SHEET_WIDTH_MULTIPLIER)
+
+  return {
+    captureWidth,
+    captureHeight,
+    pageWidthPt: roundTo(pageHeightPt * (captureWidth / captureHeight), 2),
+    pageHeightPt: roundTo(pageHeightPt, 2),
+  }
+}
+
+function consumeBlocksByHeight(blocks: string[], container: HTMLElement): string[] {
   const collected: string[] = []
-  let used = 0
+  const contentRoot = container.querySelector('.explanation-content')
+  if (!(contentRoot instanceof HTMLElement)) {
+    return collected
+  }
+  contentRoot.innerHTML = ''
 
   while (blocks.length > 0) {
     const next = blocks[0]
-    const cost = blockCost(next)
-    const willOverflow = used + cost > capacity
+    const probe = document.createElement('div')
+    probe.style.display = 'flow-root'
+    probe.innerHTML = renderExplanationMarkdown(next)
+    contentRoot.appendChild(probe)
 
-    if (willOverflow && collected.length > 0) {
+    const willOverflow = container.scrollHeight > container.clientHeight + 1
+    if (willOverflow) {
+      contentRoot.removeChild(probe)
+      if (collected.length === 0) {
+        const splitBlocks = splitOversizedBlockForMeasurement(next)
+        if (splitBlocks.length > 1) {
+          blocks.splice(0, 1, ...splitBlocks)
+          continue
+        }
+        contentRoot.appendChild(probe)
+        collected.push(blocks.shift()!)
+      }
       break
     }
 
     collected.push(blocks.shift()!)
-    used += cost
-
-    if (willOverflow) {
-      break
-    }
   }
 
   return collected
@@ -246,7 +417,7 @@ function consumeBlocks(blocks: string[], capacity: number): string[] {
 function blockCost(block: string): number {
   const text = block
     .replace(/!\[[^\]]*]\([^)]*\)/g, '')
-    .replace(/\[[^\]]*]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)]\([^)]*\)/g, '$1')
     .replace(/[`*_>#-]/g, '')
     .trim()
 
@@ -258,12 +429,54 @@ function blockCost(block: string): number {
   return text.length + paragraphCount * 55 + headingBonus + listBonus + tableBonus
 }
 
-function renderBlocks(blocks: string[]): string {
-  if (blocks.length === 0) {
-    return ''
+function splitOversizedBlockForMeasurement(block: string): string[] {
+  const aggressive = splitLargeBlockForPagination(block, true)
+  if (aggressive.length > 1) {
+    return aggressive
   }
 
-  return renderMarkdownWithMath(blocks.join('\n\n'))
+  const lineChunks = splitMultilineBlock(block)
+  if (lineChunks.length > 1) {
+    return lineChunks
+  }
+
+  return [block]
+}
+
+function splitLargeBlockForPagination(block: string, force = false): string[] {
+  const cost = blockCost(block)
+  if (!force && cost <= MAX_BLOCK_COST) {
+    return [block]
+  }
+
+  const trimmed = block.trim()
+  if (!trimmed || isStickyLeadingBlock(trimmed) || isFenceBlock(trimmed) || isDisplayMathBlock(trimmed) || isTableBlock(trimmed)) {
+    return [block]
+  }
+
+  const targetChunkLength = force ? 90 : 140
+
+  const headingChunks = splitHeadingPrefixedBlock(block, targetChunkLength)
+  if (headingChunks.length > 1) {
+    return headingChunks.flatMap((item) => splitLargeBlockForPagination(item, force))
+  }
+
+  const listItems = splitListBlock(block)
+  if (listItems.length > 1) {
+    return listItems.flatMap((item) => splitLargeBlockForPagination(item, force))
+  }
+
+  const singleListItemChunks = splitSingleListItemBlock(block, targetChunkLength)
+  if (singleListItemChunks.length > 1) {
+    return singleListItemChunks.flatMap((item) => splitLargeBlockForPagination(item, force))
+  }
+
+  const paragraphChunks = splitParagraphBlock(block, targetChunkLength)
+  if (paragraphChunks.length > 1) {
+    return paragraphChunks.flatMap((item) => splitLargeBlockForPagination(item, force))
+  }
+
+  return [block]
 }
 
 function buildFirstSheet(
@@ -279,11 +492,13 @@ function buildFirstSheet(
           <img src="${pageData.dataUrl}" alt="Page ${pageData.pageNum}" />
         </div>
         <div class="sheet-panel sheet-panel--text">
-          ${
-            isEmptyExplanation
-              ? `<div class="explanation-empty">暂无讲解</div>`
-              : `<div class="explanation-content">${explanationHtml}</div>`
-          }
+          <div class="text-surface">
+            ${
+              isEmptyExplanation
+                ? `<div class="explanation-empty">暂无讲解</div>`
+                : `<div class="explanation-content">${explanationHtml}</div>`
+            }
+          </div>
         </div>
       </div>
     </section>
@@ -297,12 +512,17 @@ function buildContinuationSheet(
   return `
     <section class="export-sheet export-sheet--continuation">
       <div class="sheet-grid sheet-grid--continuation">
-        <div class="sheet-panel sheet-panel--text">
-          <div class="continuation-marker">P${pageNum} 讲解续页</div>
-          <div class="explanation-content">${continuation.leftHtml || ''}</div>
+        <div class="sheet-panel sheet-panel--text sheet-panel--text-continued">
+          <span class="page-label page-label--continuation">P${pageNum}+</span>
+          <div class="text-surface text-surface--continuation">
+            <div class="continuation-marker">第 ${pageNum} 页讲解续页</div>
+            <div class="explanation-content">${continuation.leftHtml || ''}</div>
+          </div>
         </div>
         <div class="sheet-panel sheet-panel--text">
-          <div class="explanation-content">${continuation.rightHtml || ''}</div>
+          <div class="text-surface text-surface--continuation">
+            <div class="explanation-content">${continuation.rightHtml || ''}</div>
+          </div>
         </div>
       </div>
     </section>
@@ -377,8 +597,10 @@ function buildExportStyles(forPrint: boolean): string {
   .export-sheet {
     margin: 16px 24px;
     border: 1px solid #e0d8cc;
-    border-radius: 12px;
-    background: #fff;
+    border-radius: 14px;
+    background:
+      linear-gradient(180deg, #fffdf9 0%, #fffaf4 100%);
+    box-shadow: 0 8px 22px rgba(93, 66, 35, 0.08);
     overflow: hidden;
   }
   .export-sheet--continuation {
@@ -411,14 +633,17 @@ function buildExportStyles(forPrint: boolean): string {
     box-shadow: 0 2px 8px rgba(0,0,0,0.08);
   }
   .sheet-panel--text {
-    padding: 16px 20px;
+    padding: 14px 16px;
     overflow: hidden;
+    position: relative;
+    background: linear-gradient(180deg, #fffefc 0%, #fcf8f2 100%);
   }
   .continuation-marker {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
     color: #8a6d52;
     font-size: 0.82rem;
     font-weight: 700;
+    letter-spacing: 0.02em;
   }
 
   .page-label {
@@ -432,6 +657,31 @@ function buildExportStyles(forPrint: boolean): string {
     padding: 2px 8px;
     border-radius: 4px;
     z-index: 1;
+  }
+  .page-label--continuation {
+    top: 8px;
+    left: 8px;
+    background: linear-gradient(135deg, #5f4325 0%, #8d673e 100%);
+    box-shadow: 0 6px 14px rgba(95, 67, 37, 0.24);
+  }
+  .sheet-panel--text-continued {
+    padding-top: 32px;
+  }
+  .text-surface {
+    height: 100%;
+    min-height: 0;
+    border: 1px solid #eadfce;
+    border-radius: 12px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.98) 0%, rgba(252,247,239,0.96) 100%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.9),
+      0 2px 8px rgba(103, 76, 44, 0.05);
+    padding: 16px 18px;
+    overflow: hidden;
+  }
+  .text-surface--continuation {
+    padding-top: 18px;
   }
 
   .explanation-empty {
@@ -527,13 +777,14 @@ function buildCaptureStyles(): string {
     box-sizing: border-box;
   }
   .booklearning-export-capture {
-    width: ${CAPTURE_SHEET_WIDTH}px;
-    height: ${CAPTURE_SHEET_HEIGHT}px;
+    width: var(--capture-sheet-width, 1400px);
+    height: var(--capture-sheet-height, 990px);
     margin: 0;
     padding: 0;
     background: #ffffff;
     color: #333;
     font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+    line-height: 1.6;
   }
   .booklearning-export-capture .export-sheet {
     width: 100%;
@@ -541,7 +792,9 @@ function buildCaptureStyles(): string {
     margin: 0;
     border: 1px solid #e0d8cc;
     border-radius: 0;
-    background: #fff;
+    background:
+      linear-gradient(180deg, #fffdf9 0%, #fffaf4 100%);
+    box-shadow: none;
     overflow: hidden;
   }
   .booklearning-export-capture .sheet-grid {
@@ -572,19 +825,23 @@ function buildCaptureStyles(): string {
     height: calc(100% - 8px);
     object-fit: contain;
     border-radius: 4px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
     background: #fff;
   }
   .booklearning-export-capture .sheet-panel--text {
-    padding: 16px 20px;
+    padding: 14px 16px;
     overflow: hidden;
-    background: #fff;
+    position: relative;
+    background: linear-gradient(180deg, #fffefc 0%, #fcf8f2 100%);
+  }
+  .booklearning-export-capture .sheet-panel--text-continued {
+    padding-top: 32px;
   }
   .booklearning-export-capture .page-label {
     position: absolute;
     top: 4px;
     left: 4px;
-    background: rgba(74,53,32,0.75);
+    background: rgba(74, 53, 32, 0.75);
     color: #fff;
     font-size: 0.72rem;
     font-weight: 700;
@@ -592,11 +849,34 @@ function buildCaptureStyles(): string {
     border-radius: 4px;
     z-index: 1;
   }
+  .booklearning-export-capture .page-label--continuation {
+    top: 8px;
+    left: 8px;
+    background: linear-gradient(135deg, #5f4325 0%, #8d673e 100%);
+    box-shadow: 0 6px 14px rgba(95, 67, 37, 0.24);
+  }
+  .booklearning-export-capture .text-surface {
+    height: 100%;
+    min-height: 0;
+    border: 1px solid #eadfce;
+    border-radius: 12px;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(252, 247, 239, 0.96) 100%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.9),
+      0 2px 8px rgba(103, 76, 44, 0.05);
+    padding: 16px 18px;
+    overflow: hidden;
+  }
+  .booklearning-export-capture .text-surface--continuation {
+    padding-top: 18px;
+  }
   .booklearning-export-capture .continuation-marker {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
     color: #8a6d52;
     font-size: 0.82rem;
     font-weight: 700;
+    letter-spacing: 0.02em;
   }
   .booklearning-export-capture .explanation-empty {
     display: flex;
@@ -627,7 +907,7 @@ function buildCaptureStyles(): string {
   .booklearning-export-capture .explanation-content code {
     padding: 1px 5px;
     border-radius: 4px;
-    background: rgba(178,110,24,0.08);
+    background: rgba(178, 110, 24, 0.08);
     font-family: Consolas, "Courier New", monospace;
     font-size: 0.87em;
   }
@@ -643,7 +923,7 @@ function buildCaptureStyles(): string {
     margin: 0.5em 0;
     padding: 6px 12px;
     border-left: 3px solid #b26e18;
-    background: rgba(178,110,24,0.04);
+    background: rgba(178, 110, 24, 0.04);
   }
   .booklearning-export-capture .explanation-content table {
     width: 100%;
@@ -671,6 +951,230 @@ function buildCaptureStyles(): string {
   `
 }
 
+function isFenceBlock(block: string): boolean {
+  return /^(`{3,}|~{3,})/.test(block)
+}
+
+function isDisplayMathBlock(block: string): boolean {
+  return /^\$\$[\s\S]*\$\$$/.test(block)
+}
+
+function isTableBlock(block: string): boolean {
+  const lines = block.split('\n').map((line) => line.trim()).filter(Boolean)
+  if (lines.length < 2) {
+    return false
+  }
+
+  return lines[0].includes('|') && /^[:|\-\s]+$/.test(lines[1])
+}
+
+function splitListBlock(block: string): string[] {
+  const lines = block.replace(/\r\n/g, '\n').split('\n')
+  const items: string[] = []
+  let current: string[] = []
+
+  for (const line of lines) {
+    if (/^\s*(?:[-*+]|\d+\.)\s+/.test(line)) {
+      if (current.length > 0) {
+        items.push(current.join('\n').trim())
+      }
+      current = [line]
+      continue
+    }
+
+    if (current.length > 0) {
+      current.push(line)
+    } else {
+      return [block]
+    }
+  }
+
+  if (current.length > 0) {
+    items.push(current.join('\n').trim())
+  }
+
+  return items.length > 1 ? items : [block]
+}
+
+function splitHeadingPrefixedBlock(block: string, targetChunkLength: number): string[] {
+  const normalized = block.replace(/\r\n/g, '\n')
+  const lines = normalized.split('\n')
+  const heading = lines[0]?.trim()
+
+  if (!heading || !/^#{1,6}\s+/.test(heading) || lines.length < 2) {
+    return [block]
+  }
+
+  const body = lines.slice(1).join('\n').trim()
+  if (!body) {
+    return [block]
+  }
+
+  const bodyChunks = splitParagraphBlock(body, targetChunkLength)
+  if (bodyChunks.length <= 1) {
+    return [block]
+  }
+
+  return [`${heading}\n\n${bodyChunks[0]}`, ...bodyChunks.slice(1)]
+}
+
+function splitSingleListItemBlock(block: string, targetChunkLength: number): string[] {
+  const normalized = block.replace(/\r\n/g, '\n')
+  const lines = normalized.split('\n')
+  const match = lines[0]?.match(/^(\s*(?:[-*+]|\d+\.)\s+)(.*)$/)
+  if (!match) {
+    return [block]
+  }
+
+  const [, marker, firstLine] = match
+  const content = [firstLine, ...lines.slice(1).map((line) => line.trim())]
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const chunks = splitTextIntoChunks(content, targetChunkLength)
+  if (chunks.length <= 1) {
+    return [block]
+  }
+
+  return chunks.map((chunk) => `${marker}${chunk}`)
+}
+
+function splitParagraphBlock(block: string, targetChunkLength: number): string[] {
+  const normalized = block
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const chunks = splitTextIntoChunks(normalized, targetChunkLength)
+  return chunks.length > 1 ? chunks : [block]
+}
+
+function splitMultilineBlock(block: string): string[] {
+  const lines = block
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+
+  if (lines.length < 2) {
+    return [block]
+  }
+
+  const mid = Math.ceil(lines.length / 2)
+  const left = lines.slice(0, mid).join('\n').trim()
+  const right = lines.slice(mid).join('\n').trim()
+
+  return left && right ? [left, right] : [block]
+}
+
+function splitTextIntoChunks(text: string, targetChunkLength: number): string[] {
+  const sentences = splitTextIntoSentences(text)
+  if (sentences.length <= 1) {
+    return splitLongTextFallback(text, targetChunkLength)
+  }
+
+  const chunks: string[] = []
+  let current = ''
+
+  for (const sentence of sentences) {
+    const candidate = current ? `${current} ${sentence}` : sentence
+    if (candidate.length > targetChunkLength && current) {
+      chunks.push(current)
+      current = sentence
+      continue
+    }
+    current = candidate
+  }
+
+  if (current) {
+    chunks.push(current)
+  }
+
+  return chunks.length > 1 ? chunks : splitLongTextFallback(text, targetChunkLength)
+}
+
+function splitTextIntoSentences(text: string): string[] {
+  const sentences: string[] = []
+  let current = ''
+  let inlineDollarCount = 0
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    current += char
+
+    if (char === '$' && !isEscaped(text, index) && text[index - 1] !== '$' && text[index + 1] !== '$') {
+      inlineDollarCount += 1
+      continue
+    }
+
+    if (inlineDollarCount % 2 === 1) {
+      continue
+    }
+
+    const isSentenceBoundary = /[。！？!?；;：:]/.test(char)
+      || (/[，,]/.test(char) && current.length >= 120)
+
+    if (!isSentenceBoundary) {
+      continue
+    }
+
+    const trimmed = current.trim()
+    if (trimmed) {
+      sentences.push(trimmed)
+    }
+    current = ''
+  }
+
+  const tail = current.trim()
+  if (tail) {
+    sentences.push(tail)
+  }
+
+  return sentences
+}
+
+function splitLongTextFallback(text: string, targetChunkLength: number): string[] {
+  const hardLimit = Math.max(targetChunkLength + 20, Math.round(targetChunkLength * 1.15))
+  if (text.length <= hardLimit) {
+    return [text]
+  }
+
+  const chunks: string[] = []
+  let start = 0
+
+  while (start < text.length) {
+    let end = Math.min(start + targetChunkLength, text.length)
+
+    if (end < text.length) {
+      const windowSize = Math.max(targetChunkLength + 40, targetChunkLength)
+      const slice = text.slice(start, Math.min(start + windowSize, text.length))
+      const breakOffset = findPreferredBreakOffset(slice, Math.max(30, Math.floor(targetChunkLength * 0.45)))
+      if (breakOffset > 0) {
+        end = start + breakOffset
+      }
+    }
+
+    chunks.push(text.slice(start, end).trim())
+    start = end
+  }
+
+  return chunks.filter(Boolean)
+}
+
+function findPreferredBreakOffset(text: string, minOffset: number): number {
+  for (let index = text.length - 1; index >= minOffset; index -= 1) {
+    if (/[。！？!?；;：:，,\s]/.test(text[index])) {
+      return index + 1
+    }
+  }
+
+  return -1
+}
+
 function buildExportBody(title: string, body: string): string {
   return `
   <div class="export-header">
@@ -681,19 +1185,7 @@ function buildExportBody(title: string, body: string): string {
   `
 }
 
-function renderMarkdownWithMath(markdown: string): string {
-  const normalized = normalizeMathMarkdown(markdown)
-  const placeholders: string[] = []
-
-  const textWithPlaceholders = normalized
-    .replace(/\$\$([\s\S]*?)\$\$/g, (_, expr: string) => pushMathPlaceholder(placeholders, expr, true))
-    .replace(/\$([^$\n]+)\$/g, (_, expr: string) => pushMathPlaceholder(placeholders, expr, false))
-
-  const html = marked.parse(textWithPlaceholders) as string
-  return html.replace(/@@BLMATH(\d+)@@/g, (_, indexText: string) => placeholders[Number(indexText)] || '')
-}
-
-async function renderSheetToBase64(sheetHtml: string): Promise<string> {
+function createMeasurementHost(sheet: ExportSheet): HTMLDivElement {
   const style = document.createElement('style')
   style.textContent = buildCaptureStyles()
   document.head.appendChild(style)
@@ -704,8 +1196,20 @@ async function renderSheetToBase64(sheetHtml: string): Promise<string> {
   host.style.top = '0'
   host.style.pointerEvents = 'none'
   host.style.opacity = '0'
-  host.innerHTML = `<div class="booklearning-export-capture">${sheetHtml}</div>`
+  host.dataset.exportHost = 'true'
+  host.innerHTML = `<div class="booklearning-export-capture" style="--capture-sheet-width:${sheet.captureWidth}px; --capture-sheet-height:${sheet.captureHeight}px;">${sheet.html}</div>`
+  ;(host as HTMLDivElement & { __exportStyle?: HTMLStyleElement }).__exportStyle = style
   document.body.appendChild(host)
+  return host
+}
+
+function destroyMeasurementHost(host: HTMLDivElement): void {
+  host.remove()
+  ;(host as HTMLDivElement & { __exportStyle?: HTMLStyleElement }).__exportStyle?.remove()
+}
+
+async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
+  const host = createMeasurementHost(sheet)
 
   try {
     const captureNode = host.firstElementChild as HTMLElement | null
@@ -717,18 +1221,17 @@ async function renderSheetToBase64(sheetHtml: string): Promise<string> {
 
     const dataUrl = await toPng(captureNode, {
       cacheBust: true,
-      pixelRatio: 2,
+      pixelRatio: 1.6,
       backgroundColor: '#ffffff',
-      canvasWidth: CAPTURE_SHEET_WIDTH * 2,
-      canvasHeight: CAPTURE_SHEET_HEIGHT * 2,
-      width: CAPTURE_SHEET_WIDTH,
-      height: CAPTURE_SHEET_HEIGHT,
+      canvasWidth: Math.round(sheet.captureWidth * 1.6),
+      canvasHeight: Math.round(sheet.captureHeight * 1.6),
+      width: sheet.captureWidth,
+      height: sheet.captureHeight,
     })
 
     return dataUrl.replace(/^data:image\/png;base64,/, '')
   } finally {
-    host.remove()
-    style.remove()
+    destroyMeasurementHost(host)
   }
 }
 
@@ -771,17 +1274,6 @@ function nextFrame(): Promise<void> {
   })
 }
 
-function pushMathPlaceholder(placeholders: string[], expr: string, displayMode: boolean): string {
-  const html = katex.renderToString(expr.trim(), {
-    displayMode,
-    throwOnError: false,
-    output: 'htmlAndMathml',
-    strict: 'ignore',
-  })
-  const index = placeholders.push(html) - 1
-  return `@@BLMATH${index}@@`
-}
-
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -822,4 +1314,36 @@ function escapeHtml(str: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+function roundTo(value: number, digits: number): number {
+  const factor = 10 ** digits
+  return Math.round(value * factor) / factor
+}
+
+function countUnescapedDoubleDollar(line: string): number {
+  let count = 0
+
+  for (let index = 0; index < line.length - 1; index += 1) {
+    if (line[index] === '$' && line[index + 1] === '$' && !isEscaped(line, index)) {
+      count += 1
+      index += 1
+    }
+  }
+
+  return count
+}
+
+function isEscaped(input: string, index: number): boolean {
+  let backslashCount = 0
+
+  for (let cursor = index - 1; cursor >= 0 && input[cursor] === '\\'; cursor -= 1) {
+    backslashCount += 1
+  }
+
+  return backslashCount % 2 === 1
 }

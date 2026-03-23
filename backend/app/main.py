@@ -9,6 +9,7 @@ from app.api.ai_config_routes import router as ai_config_router
 from app.api.prompt_routes import router as prompt_router
 from app.api.parse_routes import router as parse_router
 from app.api.export_routes import router as export_router
+from app.api.document_routes import router as document_router
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 
@@ -53,3 +54,4 @@ app.include_router(ai_config_router, prefix=settings.api_prefix)
 app.include_router(prompt_router, prefix=settings.api_prefix)
 app.include_router(parse_router, prefix=settings.api_prefix)
 app.include_router(export_router, prefix=settings.api_prefix)
+app.include_router(document_router, prefix=settings.api_prefix)

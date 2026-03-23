@@ -1,8 +1,13 @@
 const API_BASE = 'http://localhost:8000/api/v1'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers ?? {})
+  if (!(options?.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...options,
   })
   if (!response.ok) {
@@ -138,4 +143,61 @@ export function saveEditedExplanation(pdfHash: string, pageNumber: number, expla
 
 export function loadAllCachedExplanations(pdfHash: string) {
   return request<{ pdf_hash: string; pages: Record<number, string>; page_costs: Record<number, ParseCostInfo> }>(`/parse/cache/${pdfHash}`)
+}
+
+// Documents
+export type LibraryDocument = {
+  id: string
+  pdf_hash: string
+  title: string
+  original_file_name: string
+  storage_file_name: string
+  file_size_bytes: number
+  page_count: number | null
+  imported_at: string
+  updated_at: string
+  last_opened_at: string | null
+  last_read_page: number
+  cached_pages: number
+}
+
+export type DocumentImportResponse = {
+  created: boolean
+  document: LibraryDocument
+}
+
+export function listDocuments() {
+  return request<LibraryDocument[]>('/documents/')
+}
+
+export function importDocument(file: File) {
+  const body = new FormData()
+  body.append('file', file)
+  return request<DocumentImportResponse>('/documents/import', {
+    method: 'POST',
+    body,
+  })
+}
+
+export function deleteDocument(documentId: string, removeCache = true) {
+  return request<{ ok: boolean; document_id: string; remove_cache: boolean }>(
+    `/documents/${documentId}?remove_cache=${removeCache ? 'true' : 'false'}`,
+    { method: 'DELETE' },
+  )
+}
+
+export function updateDocumentProgress(documentId: string, lastReadPage: number) {
+  return request<LibraryDocument>(`/documents/${documentId}/progress`, {
+    method: 'PATCH',
+    body: JSON.stringify({ last_read_page: lastReadPage }),
+  })
+}
+
+export async function downloadDocumentPdf(documentId: string): Promise<Uint8Array> {
+  const response = await fetch(`${API_BASE}/documents/${documentId}/file`)
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`API ${response.status}: ${body}`)
+  }
+  return new Uint8Array(await response.arrayBuffer())
 }

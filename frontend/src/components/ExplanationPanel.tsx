@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { CSSProperties } from 'react'
 import 'katex/dist/katex.min.css'
-import rehypeKatex from 'rehype-katex'
-import Markdown from 'react-markdown'
-import remarkMath from 'remark-math'
 import { saveEditedExplanation } from '../lib/api'
-import { normalizeMathMarkdown } from '../lib/mathMarkdown'
+import { renderExplanationMarkdown } from '../lib/renderMarkdown'
+
+const MIN_AI_FONT_SIZE = 13
+const MAX_AI_FONT_SIZE = 24
+const DEFAULT_AI_FONT_SIZE = 15
 
 type Props = {
   locale: 'zh' | 'en'
@@ -31,9 +33,14 @@ export default function ExplanationPanel({
   const [editText, setEditText] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
+  const [fontSize, setFontSize] = useState(DEFAULT_AI_FONT_SIZE)
   const renderedExplanation = useMemo(
-    () => normalizeMathMarkdown(explanation || ''),
+    () => renderExplanationMarkdown(explanation || ''),
     [explanation],
+  )
+  const panelStyle = useMemo(
+    () => ({ '--ai-font-size': `${fontSize}px` } as CSSProperties),
+    [fontSize],
   )
 
   // 切换页面时退出编辑模式
@@ -51,6 +58,10 @@ export default function ExplanationPanel({
   const handleCancelEdit = useCallback(() => {
     setIsEditing(false)
     setSaveMsg('')
+  }, [])
+
+  const handleAdjustFontSize = useCallback((delta: number) => {
+    setFontSize((prev) => Math.min(MAX_AI_FONT_SIZE, Math.max(MIN_AI_FONT_SIZE, prev + delta)))
   }, [])
 
   const handleSave = useCallback(async () => {
@@ -87,10 +98,29 @@ export default function ExplanationPanel({
       : 'page-status--empty'
 
   return (
-    <div className="explanation-panel">
+    <div className="explanation-panel" style={panelStyle}>
       <div className="explanation-header">
         <h3>{isZh ? 'AI 讲解' : 'AI Explanation'}</h3>
         <div className="explanation-header-right">
+          <div className="explanation-font-controls" aria-label={isZh ? 'AI 字体大小控制' : 'AI font size controls'}>
+            <button
+              type="button"
+              onClick={() => handleAdjustFontSize(-1)}
+              disabled={fontSize <= MIN_AI_FONT_SIZE}
+              aria-label={isZh ? '减小 AI 字体' : 'Decrease AI font size'}
+            >
+              A-
+            </button>
+            <span>{fontSize}px</span>
+            <button
+              type="button"
+              onClick={() => handleAdjustFontSize(1)}
+              disabled={fontSize >= MAX_AI_FONT_SIZE}
+              aria-label={isZh ? '增大 AI 字体' : 'Increase AI font size'}
+            >
+              A+
+            </button>
+          </div>
           <span className={`page-status ${statusClass}`}>{pageStatus}</span>
           <span className="explanation-page-info">
             {isZh ? `第 ${currentPage} / ${pageCount} 页` : `Page ${currentPage} / ${pageCount}`}
@@ -122,11 +152,10 @@ export default function ExplanationPanel({
             </div>
           </div>
         ) : explanation ? (
-          <div className="explanation-content">
-            <Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-              {renderedExplanation}
-            </Markdown>
-          </div>
+          <div
+            className="explanation-content"
+            dangerouslySetInnerHTML={{ __html: renderedExplanation }}
+          />
         ) : (
           <div className="explanation-empty">
             <div className="empty-icon">?</div>

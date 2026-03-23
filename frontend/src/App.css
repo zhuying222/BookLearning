@@ -241,30 +241,50 @@
 
 .bookshelf-strip-main {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 10px;
   min-width: 0;
+  justify-content: center;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border-radius: 18px;
+  border: 1px solid rgba(132, 95, 46, 0.1);
+  background:
+    linear-gradient(180deg, rgba(255, 252, 247, 0.92), rgba(248, 243, 235, 0.82));
+  box-shadow: 0 16px 28px -24px rgba(71, 48, 19, 0.26);
+  backdrop-filter: blur(8px);
+}
+
+.bookshelf-strip-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   flex-wrap: wrap;
-  justify-content: flex-end;
-  padding-bottom: 8px;
 }
 
 .bookshelf-strip-main strong {
-  font-size: 0.98rem;
+  font-size: 1rem;
   color: var(--text-h);
 }
 
 .bookshelf-strip-main span,
-.bookshelf-strip-hint {
+.bookshelf-strip-hint,
+.bookshelf-strip-count {
   font-size: 0.82rem;
   color: var(--muted);
 }
 
-.bookshelf-strip-hint {
+.bookshelf-strip-count {
   padding: 4px 10px;
   border-radius: 999px;
-  background: rgba(255, 250, 243, 0.86);
-  border: 1px solid rgba(130, 93, 43, 0.08);
+  background: rgba(165, 121, 62, 0.08);
+  color: rgba(102, 70, 28, 0.76);
+  border: 1px solid rgba(132, 95, 46, 0.08);
+}
+
+.bookshelf-strip-hint {
+  line-height: 1.5;
 }
 
 .bookshelf-banner {
@@ -1374,6 +1394,10 @@
 
   .bookshelf-brand-block {
     align-items: flex-start;
+  }
+
+  .bookshelf-strip-main {
+    margin-bottom: 0;
   }
 
   .bookshelf-grid {

@@ -94,8 +94,10 @@ export default function Bookshelf({
           </div>
         </div>
         <div className="bookshelf-strip-main">
-          <strong>{isZh ? '本地书架' : 'Library'}</strong>
-          <span>{isZh ? `${documents.length} 本 PDF` : `${documents.length} PDFs`}</span>
+          <div className="bookshelf-strip-row">
+            <strong>{isZh ? '本地书架' : 'Library'}</strong>
+            <span className="bookshelf-strip-count">{isZh ? `${documents.length} 本 PDF` : `${documents.length} PDFs`}</span>
+          </div>
           <span className="bookshelf-strip-hint">
             {isZh ? '点击进入，右键删除' : 'Click to open, right click to delete'}
           </span>

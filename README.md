@@ -56,6 +56,7 @@ uvicorn app.main:app --reload --port 8000
 - `data/`、`exports/`、`logs/` 默认不纳入版本控制，用于保存本地配置、缓存、导出物和日志
 - AI Key 等敏感数据只应保存在本地 `data/ai_configs.json`，不会进入 Git 提交
 - 提交前可运行以下脚本做仓库审计：
+<img width="3092" height="1688" alt="image" src="https://github.com/user-attachments/assets/15bfa587-92e9-43b1-87ca-86ab7d7f3245" />
 
 ```powershell
 cd D:\booklearning

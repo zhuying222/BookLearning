@@ -3,8 +3,19 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.core.redaction import redact_sensitive_text
-from app.models.parse import ParseCostInfo, ParsePageRequest, ParsePageResponse, ParseRangeRequest, TaskStatusResponse
-from app.services import ai_config_service, cache_service, task_service
+from app.models.parse import (
+    FollowUpPagesResponse,
+    FollowUpRecord,
+    FollowUpRequest,
+    FollowUpResponse,
+    ParseCostInfo,
+    ParsePageRequest,
+    ParsePageResponse,
+    ParseRangeRequest,
+    TaskStatusResponse,
+    UpdateFollowUpRequest,
+)
+from app.services import ai_config_service, cache_service, followup_service, task_service
 from app.services.activity_service import log_activity
 from app.services.ai_service import call_vision_model
 from app.services.prompt_service import get_prompt_config
@@ -73,6 +84,58 @@ async def parse_single_page(req: ParsePageRequest):
         pdf_hash=req.pdf_hash,
         page_number=req.page_number,
         explanation=explanation,
+        model_name=config.model_name,
+        cost_info=ParseCostInfo(**cost_info.__dict__) if cost_info else None,
+    )
+
+
+@router.post("/follow-up", response_model=FollowUpResponse)
+async def follow_up_page(req: FollowUpRequest):
+    config = (
+        ai_config_service.get_config(req.config_id)
+        if req.config_id
+        else ai_config_service.get_default_config()
+    )
+    if config is None:
+        raise HTTPException(status_code=400, detail="No AI config available. Please add one in AI Config panel.")
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    if not req.current_explanation.strip():
+        raise HTTPException(status_code=400, detail="Current explanation cannot be empty")
+
+    context_summary = _build_context_for_page(req.pdf_hash, req.page_number)
+    extra_system_prompt = (
+        "当前页面已经有一份基础讲解。你现在处于追问模式。\n"
+        "请优先回答用户这一次追问，不要整页重写。\n"
+        "如果已有讲解与图片内容冲突，以图片内容为准并直接指出修正。\n"
+        f"当前页已有讲解如下：\n{req.current_explanation.strip()}"
+    )
+    user_text = f"请结合当前页图片和已有讲解，回答这次追问：\n{req.question.strip()}"
+
+    try:
+        answer, cost_info = await call_vision_model(
+            config=config,
+            image_base64=req.image_base64,
+            context_summary=context_summary,
+            extra_system_prompt=extra_system_prompt,
+            user_text_override=user_text,
+        )
+    except Exception as e:
+        sanitized_error = redact_sensitive_text(str(e))
+        logger.exception("Follow-up failed for pdf=%s page=%d", req.pdf_hash[:8], req.page_number)
+        log_activity(
+            "follow_up_failed",
+            {"pdf_hash": req.pdf_hash[:8], "page": req.page_number, "error": sanitized_error},
+        )
+        raise HTTPException(status_code=502, detail=f"AI service error: {sanitized_error}") from e
+
+    record = followup_service.add_followup(req.pdf_hash, req.page_number, req.question.strip(), answer)
+    logger.info("Follow-up completed for pdf=%s page=%d", req.pdf_hash[:8], req.page_number)
+    log_activity("follow_up", {"pdf_hash": req.pdf_hash[:8], "page": req.page_number, "model": config.model_name})
+    return FollowUpResponse(
+        pdf_hash=req.pdf_hash,
+        page_number=req.page_number,
+        follow_up=FollowUpRecord(**record),
         model_name=config.model_name,
         cost_info=ParseCostInfo(**cost_info.__dict__) if cost_info else None,
     )
@@ -168,6 +231,42 @@ async def save_edited(pdf_hash: str, page_number: int, body: dict):
 async def get_all_cached(pdf_hash: str):
     results, page_costs = cache_service.get_all_cached_pages(pdf_hash)
     return {"pdf_hash": pdf_hash, "pages": results, "page_costs": page_costs}
+
+
+@router.get("/follow-up/{pdf_hash}", response_model=FollowUpPagesResponse)
+async def get_all_followups(pdf_hash: str):
+    pages = {
+        page_number: [FollowUpRecord(**record) for record in records]
+        for page_number, records in followup_service.get_followups_for_pdf(pdf_hash).items()
+    }
+    return FollowUpPagesResponse(pdf_hash=pdf_hash, pages=pages)
+
+
+@router.put("/follow-up/{pdf_hash}/{page_number}/{followup_id}", response_model=FollowUpRecord)
+async def update_followup(pdf_hash: str, page_number: int, followup_id: str, body: UpdateFollowUpRequest):
+    if not body.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    if not body.answer.strip():
+        raise HTTPException(status_code=400, detail="Answer cannot be empty")
+    try:
+        updated = followup_service.update_followup(
+            pdf_hash,
+            page_number,
+            followup_id,
+            body.question.strip(),
+            body.answer.strip(),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Follow-up not found") from exc
+    return FollowUpRecord(**updated)
+
+
+@router.delete("/follow-up/{pdf_hash}/{page_number}/{followup_id}")
+async def delete_followup(pdf_hash: str, page_number: int, followup_id: str):
+    deleted = followup_service.delete_followup(pdf_hash, page_number, followup_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    return {"ok": True, "pdf_hash": pdf_hash, "page_number": page_number, "followup_id": followup_id}
 
 
 def _build_context_for_page(pdf_hash: str, page_number: int, context_pages: int = 2) -> str | None:

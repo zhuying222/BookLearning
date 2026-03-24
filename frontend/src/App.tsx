@@ -8,19 +8,28 @@ import Bookshelf from './components/Bookshelf'
 import ExplanationPanel from './components/ExplanationPanel'
 import ParseControls from './components/ParseControls'
 import PromptEditor from './components/PromptEditor'
-import type { LibraryDocument, TaskStatus } from './lib/api'
+import type { FollowUpRecord, LibraryDocument, LibraryFolder, TaskStatus } from './lib/api'
 import {
+  createFolder,
+  deleteFolder,
   deleteDocument,
   downloadDocumentPdf,
+  followUpPage,
   getTaskStatus,
   importDocument,
-  listDocuments,
+  listLibrary,
   loadAllCachedExplanations,
+  loadSavedFollowUps,
+  moveDocument,
+  moveFolder,
   parseRange,
   parseSinglePage,
+  renameDocument,
+  renameFolder,
   updateDocumentProgress,
 } from './lib/api'
 import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
+import type { PdfExportProgress } from './lib/export'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
 import {
   loadPdfDocument,
@@ -39,6 +48,7 @@ const MAX_RIGHT_TOP_RATIO = 92
 
 type Locale = 'zh' | 'en'
 type ViewMode = 'library' | 'reader'
+type OverwriteDialogState = { page: number } | null
 
 type StatusState =
   | { key: 'idle' }
@@ -78,7 +88,9 @@ function getStatusText(locale: Locale, status: StatusState): string {
 function App() {
   const [locale, setLocale] = useState<Locale>('zh')
   const [viewMode, setViewMode] = useState<ViewMode>('library')
+  const [libraryFolders, setLibraryFolders] = useState<LibraryFolder[]>([])
   const [libraryDocuments, setLibraryDocuments] = useState<LibraryDocument[]>([])
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null)
   const [isLibraryLoading, setIsLibraryLoading] = useState(true)
   const [isImportingDocument, setIsImportingDocument] = useState(false)
   const [libraryError, setLibraryError] = useState('')
@@ -110,6 +122,12 @@ function App() {
   const [batchRangeInput, setBatchRangeInput] = useState('')
   const [batchPreparationStatus, setBatchPreparationStatus] = useState('')
   const [pagePrompts, setPagePrompts] = useState<Record<number, string>>({})
+  const [followUps, setFollowUps] = useState<Record<number, FollowUpRecord[]>>({})
+  const [followUpDrafts, setFollowUpDrafts] = useState<Record<number, string>>({})
+  const [followUpModePage, setFollowUpModePage] = useState<number | null>(null)
+  const [skipOverwritePrompt, setSkipOverwritePrompt] = useState(false)
+  const [overwriteDialog, setOverwriteDialog] = useState<OverwriteDialogState>(null)
+  const [skipOverwritePromptChecked, setSkipOverwritePromptChecked] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState('')
   const [exportAllPages, setExportAllPages] = useState(false)
@@ -125,12 +143,20 @@ function App() {
   const isZh = locale === 'zh'
   const statusText = useMemo(() => getStatusText(locale, status), [locale, status])
   const displayFileName = currentDocumentMeta?.original_file_name ?? (isZh ? '未选择文档' : 'No document selected')
+  const folderParentMap = useMemo(
+    () => new Map(libraryFolders.map((folder) => [folder.id, folder.parent_id])),
+    [libraryFolders],
+  )
   const selectedBatchPages = useMemo(
     () => parsePageSelection(batchRangeInput, pageCount),
     [batchRangeInput, pageCount],
   )
   const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
   const currentPagePrompt = pagePrompts[currentPage] ?? ''
+  const currentPageFollowUps = followUps[currentPage] ?? []
+  const currentFollowUpDraft = followUpDrafts[currentPage] ?? ''
+  const isCurrentPageFollowUpMode = followUpModePage === currentPage
+  const currentPageExplanation = explanations[currentPage]?.trim() ?? ''
   const configuredPromptCount = useMemo(
     () => Object.values(pagePrompts).filter((value) => value.trim()).length,
     [pagePrompts],
@@ -145,17 +171,61 @@ function App() {
     })
   }, [])
 
+  const applyFollowUpsToPage = useCallback((pageNumber: number, items: FollowUpRecord[]) => {
+    setFollowUps((prev) => {
+      if (items.length === 0) {
+        if (!(pageNumber in prev)) {
+          return prev
+        }
+        const next = { ...prev }
+        delete next[pageNumber]
+        return next
+      }
+
+      return {
+        ...prev,
+        [pageNumber]: items,
+      }
+    })
+  }, [])
+
+  const resetReaderState = useCallback(() => {
+    if (activeDocumentRef.current) {
+      void activeDocumentRef.current.destroy()
+      activeDocumentRef.current = null
+    }
+    setCurrentDocumentMeta(null)
+    setPdfDocument(null)
+    setPdfHash('')
+    setPdfFileName('No file loaded')
+    setPageCount(0)
+    setCurrentPage(1)
+    setJumpInput('1')
+    setExplanations({})
+    setParsingPages([])
+    setPagePrompts({})
+    setFollowUps({})
+    setFollowUpDrafts({})
+    setFollowUpModePage(null)
+    setOverwriteDialog(null)
+    setSkipOverwritePromptChecked(false)
+    setActiveTask(null)
+    setStatus({ key: 'idle' })
+  }, [])
+
   const refreshLibraryDocuments = useCallback(async (silent = false) => {
     if (!silent) {
       setIsLibraryLoading(true)
     }
     setLibraryError('')
     try {
-      const documents = await listDocuments()
-      setLibraryDocuments(documents)
+      const snapshot = await listLibrary()
+      setLibraryFolders(snapshot.folders)
+      setLibraryDocuments(snapshot.documents)
+      setCurrentFolderId((prev) => (prev && snapshot.folders.some((folder) => folder.id === prev) ? prev : null))
       setCurrentDocumentMeta((prev) => {
         if (!prev) return prev
-        return documents.find((document) => document.id === prev.id) ?? prev
+        return snapshot.documents.find((document) => document.id === prev.id) ?? null
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to load library.'
@@ -186,6 +256,11 @@ function App() {
 
   useEffect(() => {
     setJumpInput(String(currentPage))
+  }, [currentPage])
+
+  useEffect(() => {
+    setOverwriteDialog(null)
+    setSkipOverwritePromptChecked(false)
   }, [currentPage])
 
   useEffect(() => {
@@ -306,6 +381,16 @@ function App() {
         setActiveTask(updated)
         if (updated.results) {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
+          if (pdfHash) {
+            const savedFollowUps = await loadSavedFollowUps(pdfHash).catch(() => null)
+            if (savedFollowUps?.pages) {
+              const mapped: Record<number, FollowUpRecord[]> = {}
+              for (const [k, v] of Object.entries(savedFollowUps.pages)) {
+                mapped[Number(k)] = v
+              }
+              setFollowUps(mapped)
+            }
+          }
         }
         if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
           setBatchRangeInput('')
@@ -327,7 +412,7 @@ function App() {
         taskPollRef.current = null
       }
     }
-  }, [activeTask?.task_id, activeTask?.status])
+  }, [activeTask?.task_id, activeTask?.status, pdfHash])
 
   const openLibraryDocument = useCallback(async (document: LibraryDocument) => {
     const requestSeq = documentLoadSeqRef.current + 1
@@ -342,6 +427,11 @@ function App() {
     setExplanations({})
     setParsingPages([])
     setPagePrompts({})
+    setFollowUps({})
+    setFollowUpDrafts({})
+    setFollowUpModePage(null)
+    setOverwriteDialog(null)
+    setSkipOverwritePromptChecked(false)
     setActiveTask(null)
     setBatchRangeInput('')
     setBatchPreparationStatus('')
@@ -395,6 +485,17 @@ function App() {
         }
         setExplanations(mapped)
       }
+
+      const savedFollowUps = await loadSavedFollowUps(document.pdf_hash).catch(() => null)
+      if (requestSeq !== documentLoadSeqRef.current || !savedFollowUps) return
+
+      if (savedFollowUps.pages && Object.keys(savedFollowUps.pages).length > 0) {
+        const mapped: Record<number, FollowUpRecord[]> = {}
+        for (const [k, v] of Object.entries(savedFollowUps.pages)) {
+          mapped[Number(k)] = v
+        }
+        setFollowUps(mapped)
+      }
     } catch (error) {
       if (requestSeq !== documentLoadSeqRef.current) return
       const message = error instanceof Error ? error.message : 'Failed to load the PDF file.'
@@ -409,7 +510,16 @@ function App() {
     }
   }, [syncDocumentIntoShelf])
 
-  const handleImportLibraryDocument = useCallback(async (file: File) => {
+  const isFolderWithin = useCallback((folderId: string | null, ancestorId: string) => {
+    let current = folderId
+    while (current) {
+      if (current === ancestorId) return true
+      current = folderParentMap.get(current) ?? null
+    }
+    return false
+  }, [folderParentMap])
+
+  const handleImportLibraryDocument = useCallback(async (file: File, targetFolderId: string | null) => {
     if (!file.name.toLowerCase().endsWith('.pdf')) {
       setLibraryError(isZh ? '请选择 PDF 文件。' : 'Please choose a PDF file.')
       return
@@ -419,11 +529,11 @@ function App() {
     setLibraryError('')
     setLibraryActionMessage('')
     try {
-      const result = await importDocument(file)
+      const result = await importDocument(file, targetFolderId)
       await refreshLibraryDocuments(true)
       setLibraryActionMessage(
         result.created
-          ? (isZh ? `已导入《${result.document.title}》到书架。` : `Imported "${result.document.title}" to your shelf.`)
+          ? (isZh ? `已导入《${result.document.title}》。` : `Imported "${result.document.title}".`)
           : (isZh ? `《${result.document.title}》已经在书架中了。` : `"${result.document.title}" is already on the shelf.`),
       )
     } catch (error) {
@@ -431,6 +541,87 @@ function App() {
       setLibraryError(message)
     } finally {
       setIsImportingDocument(false)
+    }
+  }, [isZh, refreshLibraryDocuments])
+
+  const handleCreateFolder = useCallback(async (parentFolderId: string | null) => {
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const created = await createFolder({
+        name: isZh ? '新建文件夹' : 'New Folder',
+        parent_folder_id: parentFolderId,
+      })
+      await refreshLibraryDocuments(true)
+      setCurrentFolderId(parentFolderId)
+      setLibraryActionMessage(
+        isZh ? `已创建文件夹「${created.name}」。` : `Created folder "${created.name}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to create folder.'
+      setLibraryError(message)
+    }
+  }, [isZh, refreshLibraryDocuments])
+
+  const handleRenameLibraryDocument = useCallback(async (document: LibraryDocument, name: string) => {
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const updated = await renameDocument(document.id, name)
+      syncDocumentIntoShelf(updated)
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        isZh ? `已重命名为《${updated.title}》。` : `Renamed to "${updated.title}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to rename document.'
+      setLibraryError(message)
+    }
+  }, [isZh, refreshLibraryDocuments, syncDocumentIntoShelf])
+
+  const handleRenameLibraryFolder = useCallback(async (folder: LibraryFolder, name: string) => {
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const updated = await renameFolder(folder.id, name)
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        isZh ? `已重命名文件夹为「${updated.name}」。` : `Renamed folder to "${updated.name}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to rename folder.'
+      setLibraryError(message)
+    }
+  }, [isZh, refreshLibraryDocuments])
+
+  const handleMoveLibraryDocument = useCallback(async (document: LibraryDocument, targetFolderId: string | null) => {
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const updated = await moveDocument(document.id, targetFolderId)
+      syncDocumentIntoShelf(updated)
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        isZh ? `已移动《${updated.title}》。` : `Moved "${updated.title}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to move document.'
+      setLibraryError(message)
+    }
+  }, [isZh, refreshLibraryDocuments, syncDocumentIntoShelf])
+
+  const handleMoveLibraryFolder = useCallback(async (folder: LibraryFolder, targetFolderId: string | null) => {
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      const updated = await moveFolder(folder.id, targetFolderId)
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        isZh ? `已移动文件夹「${updated.name}」。` : `Moved folder "${updated.name}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to move folder.'
+      setLibraryError(message)
     }
   }, [isZh, refreshLibraryDocuments])
 
@@ -452,22 +643,7 @@ function App() {
       await deleteDocument(document.id, removeCache)
       await refreshLibraryDocuments(true)
       if (currentDocumentMeta?.id === document.id) {
-        if (activeDocumentRef.current) {
-          void activeDocumentRef.current.destroy()
-          activeDocumentRef.current = null
-        }
-        setCurrentDocumentMeta(null)
-        setPdfDocument(null)
-        setPdfHash('')
-        setPdfFileName('No file loaded')
-        setPageCount(0)
-        setCurrentPage(1)
-        setJumpInput('1')
-        setExplanations({})
-        setParsingPages([])
-        setPagePrompts({})
-        setActiveTask(null)
-        setStatus({ key: 'idle' })
+        resetReaderState()
       }
       setLibraryActionMessage(
         removeCache
@@ -478,7 +654,35 @@ function App() {
       const message = error instanceof Error ? error.message : 'Failed to delete document.'
       setLibraryError(message)
     }
-  }, [currentDocumentMeta?.id, isZh, refreshLibraryDocuments])
+  }, [currentDocumentMeta?.id, isZh, refreshLibraryDocuments, resetReaderState])
+
+  const handleDeleteLibraryFolder = useCallback(async (folder: LibraryFolder) => {
+    const confirmed = window.confirm(
+      isZh
+        ? `删除文件夹「${folder.name}」以及其中全部书本？缓存默认保留。`
+        : `Delete folder "${folder.name}" and all books inside it? Cached explanations will be kept by default.`,
+    )
+    if (!confirmed) return
+
+    setLibraryError('')
+    setLibraryActionMessage('')
+    try {
+      await deleteFolder(folder.id, false)
+      if (isFolderWithin(currentFolderId, folder.id)) {
+        setCurrentFolderId(folder.parent_id)
+      }
+      if (currentDocumentMeta && isFolderWithin(currentDocumentMeta.parent_folder_id, folder.id)) {
+        resetReaderState()
+      }
+      await refreshLibraryDocuments(true)
+      setLibraryActionMessage(
+        isZh ? `已删除文件夹「${folder.name}」。` : `Deleted folder "${folder.name}".`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to delete folder.'
+      setLibraryError(message)
+    }
+  }, [currentDocumentMeta, currentFolderId, isFolderWithin, isZh, refreshLibraryDocuments, resetReaderState])
 
   const handleBackToLibrary = useCallback(() => {
     setViewMode('library')
@@ -516,7 +720,7 @@ function App() {
     setScale((p) => clamp(Number((p + (event.deltaY < 0 ? 0.08 : -0.08)).toFixed(2)), MIN_SCALE, MAX_SCALE))
   }
 
-  const handleParseCurrent = useCallback(async () => {
+  const runCurrentPageAction = useCallback(async (forceExplanationOverwrite: boolean) => {
     if (!pdfDocument || !pdfHash) return
     const pageToParse = currentPage
     if (parsingPages.includes(pageToParse)) return
@@ -527,14 +731,33 @@ function App() {
     try {
       const image = await renderPdfPageToDataUrl(pdfDocument, pageToParse, DEFAULT_EXPORT_SCALE)
       const base64 = image.dataUrl.replace(/^data:image\/png;base64,/, '')
-      const result = await parseSinglePage({
-        pdf_hash: pdfHash,
-        page_number: pageToParse,
-        image_base64: base64,
-        page_prompt: currentPagePrompt.trim() || undefined,
-        force: false,
-      })
-      setExplanations((prev) => ({ ...prev, [pageToParse]: result.explanation }))
+      if (isCurrentPageFollowUpMode) {
+        const question = currentFollowUpDraft.trim()
+        if (!question) {
+          throw new Error(isZh ? '请输入追问内容后再发送。' : 'Enter a follow-up question before sending.')
+        }
+        if (!currentPageExplanation) {
+          throw new Error(isZh ? '当前页还没有主讲解，暂时不能追问。' : 'A main explanation is required before follow-up.')
+        }
+
+        const result = await followUpPage({
+          pdf_hash: pdfHash,
+          page_number: pageToParse,
+          image_base64: base64,
+          question,
+          current_explanation: currentPageExplanation,
+        })
+        applyFollowUpsToPage(pageToParse, [...(followUps[pageToParse] ?? []), result.follow_up])
+      } else {
+        const result = await parseSinglePage({
+          pdf_hash: pdfHash,
+          page_number: pageToParse,
+          image_base64: base64,
+          page_prompt: currentPagePrompt.trim() || undefined,
+          force: forceExplanationOverwrite,
+        })
+        setExplanations((prev) => ({ ...prev, [pageToParse]: result.explanation }))
+      }
       setStatus({ key: 'parsed', page: pageToParse })
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Parse failed'
@@ -543,7 +766,59 @@ function App() {
     } finally {
       setParsingPages((prev) => prev.filter((page) => page !== pageToParse))
     }
-  }, [pdfDocument, pdfHash, currentPage, currentPagePrompt, parsingPages])
+  }, [
+    applyFollowUpsToPage,
+    currentFollowUpDraft,
+    currentPage,
+    currentPageExplanation,
+    currentPagePrompt,
+    followUps,
+    isCurrentPageFollowUpMode,
+    isZh,
+    parsingPages,
+    pdfDocument,
+    pdfHash,
+  ])
+
+  const handleParseCurrent = useCallback(async () => {
+    if (isCurrentPageFollowUpMode) {
+      await runCurrentPageAction(false)
+      return
+    }
+
+    if (currentPageExplanation && !skipOverwritePrompt) {
+      setOverwriteDialog({ page: currentPage })
+      setSkipOverwritePromptChecked(false)
+      return
+    }
+
+    await runCurrentPageAction(Boolean(currentPageExplanation))
+  }, [
+    currentPage,
+    currentPageExplanation,
+    isCurrentPageFollowUpMode,
+    runCurrentPageAction,
+    skipOverwritePrompt,
+  ])
+
+  const handleConfirmOverwriteParse = useCallback(() => {
+    const targetPage = overwriteDialog?.page
+    if (targetPage !== currentPage) {
+      setOverwriteDialog(null)
+      return
+    }
+    if (skipOverwritePromptChecked) {
+      setSkipOverwritePrompt(true)
+    }
+    setOverwriteDialog(null)
+    void runCurrentPageAction(true)
+  }, [currentPage, overwriteDialog?.page, runCurrentPageAction, skipOverwritePromptChecked])
+
+  const handleToggleFollowUpMode = useCallback(() => {
+    if (!currentPageExplanation) return
+    setFollowUpModePage((prev) => (prev === currentPage ? null : currentPage))
+    setParseError('')
+  }, [currentPage, currentPageExplanation])
 
   const handleParseRange = useCallback(async (rangeStr: string, force: boolean) => {
     if (!pdfDocument || !pdfHash) return
@@ -588,6 +863,26 @@ function App() {
   }, [pdfDocument, pdfHash, pageCount, pagePrompts, isZh])
 
   const handleCurrentPagePromptChange = useCallback((value: string) => {
+    if (isCurrentPageFollowUpMode) {
+      setFollowUpDrafts((prev) => {
+        const trimmed = value.trim()
+        if (!trimmed) {
+          if (!(currentPage in prev)) {
+            return prev
+          }
+          const next = { ...prev }
+          delete next[currentPage]
+          return next
+        }
+
+        return {
+          ...prev,
+          [currentPage]: value,
+        }
+      })
+      return
+    }
+
     setPagePrompts((prev) => {
       const trimmed = value.trim()
       if (!trimmed) {
@@ -604,7 +899,7 @@ function App() {
         [currentPage]: value,
       }
     })
-  }, [currentPage])
+  }, [currentPage, isCurrentPageFollowUpMode])
 
   const handleToggleCurrentPageInBatch = useCallback((checked: boolean) => {
     if (pageCount === 0) return
@@ -620,6 +915,9 @@ function App() {
   }, [currentPage, pageCount, selectedBatchPages])
 
   const hasExplanations = Object.keys(explanations).length > 0
+  const isPrimaryActionDisabled = !pdfDocument
+    || isCurrentPageParsing
+    || (isCurrentPageFollowUpMode && (!currentPageExplanation || !currentFollowUpDraft.trim()))
 
   const handleExportJson = useCallback(() => {
     if (!pdfHash) return
@@ -648,8 +946,21 @@ function App() {
     setIsExporting(true)
     setExportProgress(isZh ? '准备导出...' : 'Preparing...')
     try {
-      await exportAsPdf(pdfDocument, pdfFileName, explanations, pageCount, DEFAULT_EXPORT_SCALE, exportAllPages, (done, total) => {
-        setExportProgress(isZh ? `渲染页面 ${done}/${total}...` : `Rendering ${done}/${total}...`)
+      await exportAsPdf(pdfDocument, pdfFileName, explanations, pageCount, DEFAULT_EXPORT_SCALE, exportAllPages, (progress: PdfExportProgress) => {
+        if (progress.phase === 'render') {
+          setExportProgress(isZh ? `渲染页面 ${progress.done}/${progress.total}...` : `Rendering ${progress.done}/${progress.total}...`)
+          return
+        }
+
+        if (progress.phase === 'upload') {
+          const uploadedText = progress.total > 0
+            ? `${progress.done}/${progress.total}`
+            : `${progress.done}`
+          setExportProgress(isZh ? `上传导出页 ${uploadedText}...` : `Uploading sheets ${uploadedText}...`)
+          return
+        }
+
+        setExportProgress(isZh ? '正在合成 PDF...' : 'Finalizing PDF...')
       })
       setExportProgress(isZh ? '导出完成' : 'Export complete')
     } catch (e) {
@@ -708,15 +1019,24 @@ function App() {
       {viewMode === 'library' ? (
         <Bookshelf
           locale={locale}
+          folders={libraryFolders}
           documents={libraryDocuments}
+          currentFolderId={currentFolderId}
           currentDocumentId={currentDocumentMeta?.id ?? null}
           loading={isLibraryLoading}
           importing={isImportingDocument}
           error={libraryError}
           actionMessage={libraryActionMessage}
+          onNavigateFolder={setCurrentFolderId}
+          onCreateFolder={handleCreateFolder}
           onImport={handleImportLibraryDocument}
           onOpen={(document) => { void openLibraryDocument(document) }}
+          onRenameDocument={handleRenameLibraryDocument}
+          onRenameFolder={handleRenameLibraryFolder}
+          onMoveDocument={handleMoveLibraryDocument}
+          onMoveFolder={handleMoveLibraryFolder}
           onDelete={handleDeleteLibraryDocument}
+          onDeleteFolder={handleDeleteLibraryFolder}
         />
       ) : (
         <main
@@ -768,10 +1088,16 @@ function App() {
                 locale={locale}
                 currentPage={currentPage}
                 explanations={explanations}
+                followUps={currentPageFollowUps}
+                isFollowUpMode={isCurrentPageFollowUpMode}
                 isLoading={isCurrentPageParsing}
                 pageCount={pageCount}
                 pdfHash={pdfHash}
-                onExplanationUpdate={(page, text) => setExplanations((prev) => ({ ...prev, [page]: text }))}
+                onExplanationUpdate={(page, text) => {
+                  setExplanations((prev) => ({ ...prev, [page]: text }))
+                }}
+                onFollowUpsUpdate={applyFollowUpsToPage}
+                onToggleFollowUpMode={handleToggleFollowUpMode}
               />
             </div>
 
@@ -783,84 +1109,156 @@ function App() {
             />
 
             <div className="right-bottom">
-              <div className="ctrl-row">
-                <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage - 1)} disabled={!pdfDocument || currentPage <= 1}>
-                  {isZh ? '上一页' : 'Prev'}
-                </button>
-                <button type="button" className="ctrl-btn" onClick={() => goToPage(currentPage + 1)} disabled={!pdfDocument || currentPage >= pageCount}>
-                  {isZh ? '下一页' : 'Next'}
-                </button>
-                <label className="ctrl-check">
-                  <input
-                    type="checkbox"
-                    checked={isCurrentPageInBatch}
-                    onChange={(e) => handleToggleCurrentPageInBatch(e.target.checked)}
-                    disabled={!pdfDocument}
-                  />
-                  {isZh ? '加入批量' : 'Batch'}
-                </label>
-                <button type="button" className="ctrl-btn ctrl-btn--primary" onClick={handleParseCurrent} disabled={!pdfDocument || isCurrentPageParsing}>
-                  {isCurrentPageParsing ? (isZh ? '解析中...' : 'Parsing...') : (isZh ? '解析当前页' : 'Parse page')}
-                </button>
-              </div>
+              <div className="control-dock">
+                <div className="control-grid">
+                  <section className="control-card control-card--hero">
+                    <div className="control-card-heading">
+                      <div>
+                        <span className="control-card-kicker">{isZh ? 'Primary Action' : 'Primary Action'}</span>
+                        <h4>
+                          {isCurrentPageFollowUpMode
+                            ? (isZh ? '当前页追问' : 'Current page follow-up')
+                            : (isZh ? '当前页解析' : 'Current page parse')}
+                        </h4>
+                      </div>
+                      <label className="ctrl-check ctrl-check--pill">
+                        <input
+                          type="checkbox"
+                          checked={isCurrentPageInBatch}
+                          onChange={(e) => handleToggleCurrentPageInBatch(e.target.checked)}
+                          disabled={!pdfDocument}
+                        />
+                        {isZh ? '加入批量队列' : 'Add to batch'}
+                      </label>
+                    </div>
+                    <div className="control-action-row">
+                      <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={() => goToPage(currentPage - 1)} disabled={!pdfDocument || currentPage <= 1}>
+                        {isZh ? '上一页' : 'Prev'}
+                      </button>
+                      <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={() => goToPage(currentPage + 1)} disabled={!pdfDocument || currentPage >= pageCount}>
+                        {isZh ? '下一页' : 'Next'}
+                      </button>
+                      <button type="button" className="ctrl-btn ctrl-btn--primary ctrl-btn--flex" onClick={handleParseCurrent} disabled={isPrimaryActionDisabled}>
+                        {isCurrentPageParsing
+                          ? (isZh ? '处理中...' : 'Running...')
+                          : isCurrentPageFollowUpMode
+                            ? (isZh ? '发送' : 'Send')
+                            : (isZh ? '解析当前页' : 'Parse page')}
+                      </button>
+                    </div>
+                  </section>
 
-              <div className="ctrl-row">
-                <label className="ctrl-label">{isZh ? '跳转' : 'Go to'}</label>
-                <input className="ctrl-input" type="text" value={jumpInput} onChange={(e) => setJumpInput(e.target.value)} onKeyDown={handleJumpKeyDown} placeholder="12" />
-                <button type="button" className="ctrl-btn" onClick={handleJumpSubmit} disabled={!pdfDocument}>{isZh ? '跳转' : 'Go'}</button>
-              </div>
-
-              <ParseControls
-                locale={locale}
-                disabled={!pdfDocument}
-                activeTask={activeTask}
-                currentPage={currentPage}
-                rangeInput={batchRangeInput}
-                onRangeInputChange={setBatchRangeInput}
-                onParseRange={handleParseRange}
-                pagePrompt={currentPagePrompt}
-                onPagePromptChange={handleCurrentPagePromptChange}
-                configuredPromptCount={configuredPromptCount}
-                onTaskUpdate={setActiveTask}
-                batchPreparationStatus={batchPreparationStatus}
-              />
-
-              <div className="ctrl-row">
-                <button type="button" className="ctrl-btn" onClick={handleExportJson} disabled={!hasExplanations || isExporting}>
-                  {isZh ? '导出数据' : 'Export JSON'}
-                </button>
-                <button type="button" className="ctrl-btn" onClick={handleExportHtml} disabled={!hasExplanations || isExporting}>
-                  {isZh ? '导出 HTML' : 'Export HTML'}
-                </button>
-                <button type="button" className="ctrl-btn" onClick={handleExportPdf} disabled={!hasExplanations || isExporting}>
-                  {isZh ? '导出 PDF' : 'Export PDF'}
-                </button>
-                <label className="ctrl-check">
-                  <input type="checkbox" checked={exportAllPages} onChange={(e) => setExportAllPages(e.target.checked)} disabled={!pdfDocument} />
-                  {isZh ? '含全部页' : 'All pages'}
-                </label>
-              </div>
-
-              {exportProgress && (
-                <div className="ctrl-status">
-                  <span>{exportProgress}</span>
+                  <section className="control-card control-card--compact">
+                    <div className="control-card-heading">
+                      <div>
+                        <span className="control-card-kicker">{isZh ? 'Navigation' : 'Navigation'}</span>
+                        <h4>{isZh ? '快速跳转' : 'Quick jump'}</h4>
+                      </div>
+                    </div>
+                    <div className="control-inline-fields">
+                      <label className="ctrl-field">
+                        <span className="ctrl-field-label">{isZh ? '目标页码' : 'Target page'}</span>
+                        <input className="ctrl-input" type="text" value={jumpInput} onChange={(e) => setJumpInput(e.target.value)} onKeyDown={handleJumpKeyDown} placeholder="12" />
+                      </label>
+                      <button type="button" className="ctrl-btn ctrl-btn--block-mobile" onClick={handleJumpSubmit} disabled={!pdfDocument}>{isZh ? '跳转' : 'Go'}</button>
+                    </div>
+                  </section>
                 </div>
-              )}
 
-              <div className="ctrl-status">
-                <span>{isLoadingPdf ? getStatusText(locale, { key: 'loadingPdf', fileName: pdfFileName }) : statusText}</span>
-              </div>
+                <ParseControls
+                  locale={locale}
+                  disabled={!pdfDocument}
+                  activeTask={activeTask}
+                  selectedBatchCount={selectedBatchPages.length}
+                  rangeInput={batchRangeInput}
+                  onRangeInputChange={setBatchRangeInput}
+                  onParseRange={handleParseRange}
+                  pagePrompt={isCurrentPageFollowUpMode ? currentFollowUpDraft : currentPagePrompt}
+                  onPagePromptChange={handleCurrentPagePromptChange}
+                  configuredPromptCount={configuredPromptCount}
+                  onTaskUpdate={setActiveTask}
+                  batchPreparationStatus={batchPreparationStatus}
+                  isFollowUpMode={isCurrentPageFollowUpMode}
+                />
 
-              {(loadError || renderError || parseError) && (
-                <div className="ctrl-error">
-                  {loadError && <p>{loadError}</p>}
-                  {renderError && <p>{renderError}</p>}
-                  {parseError && <p>{parseError}</p>}
+                <section className="control-card">
+                  <div className="control-card-heading">
+                    <div>
+                      <span className="control-card-kicker">{isZh ? 'Export' : 'Export'}</span>
+                      <h4>{isZh ? '学习资料导出' : 'Export study assets'}</h4>
+                    </div>
+                    <label className="ctrl-check ctrl-check--pill">
+                      <input type="checkbox" checked={exportAllPages} onChange={(e) => setExportAllPages(e.target.checked)} disabled={!pdfDocument} />
+                      {isZh ? '包含全部页' : 'All pages'}
+                    </label>
+                  </div>
+                  <div className="control-action-row">
+                    <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={handleExportJson} disabled={!hasExplanations || isExporting}>
+                      {isZh ? '导出数据' : 'Export JSON'}
+                    </button>
+                    <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={handleExportHtml} disabled={!hasExplanations || isExporting}>
+                      {isZh ? '导出 HTML' : 'Export HTML'}
+                    </button>
+                    <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={handleExportPdf} disabled={!hasExplanations || isExporting}>
+                      {isZh ? '导出 PDF' : 'Export PDF'}
+                    </button>
+                  </div>
+                  {exportProgress && (
+                    <div className="control-banner control-banner--neutral">
+                      <span>{exportProgress}</span>
+                    </div>
+                  )}
+                </section>
+
+                <div className="control-banner control-banner--status">
+                  <span>{isLoadingPdf ? getStatusText(locale, { key: 'loadingPdf', fileName: pdfFileName }) : statusText}</span>
                 </div>
-              )}
+
+                {(loadError || renderError || parseError) && (
+                  <div className="control-banner control-banner--error">
+                    {loadError && <p>{loadError}</p>}
+                    {renderError && <p>{renderError}</p>}
+                    {parseError && <p>{parseError}</p>}
+                  </div>
+                )}
+              </div>
             </div>
           </aside>
         </main>
+      )}
+
+      {overwriteDialog && (
+        <div className="modal-overlay" onClick={() => setOverwriteDialog(null)}>
+          <div className="modal-content confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>{isZh ? '覆盖当前讲解？' : 'Replace current explanation?'}</h3>
+              <button type="button" className="modal-close" onClick={() => setOverwriteDialog(null)}>×</button>
+            </div>
+            <div className="confirm-dialog-copy">
+              <p>
+                {isZh
+                  ? `第 ${overwriteDialog.page} 页已经有讲解。重新生成后会直接覆盖当前讲解。`
+                  : `Page ${overwriteDialog.page} already has an explanation. Regenerating it will replace the current one.`}
+              </p>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={skipOverwritePromptChecked}
+                  onChange={(e) => setSkipOverwritePromptChecked(e.target.checked)}
+                />
+                {isZh ? '本次使用不再提示' : 'Do not ask again this session'}
+              </label>
+            </div>
+            <div className="button-row confirm-dialog-actions">
+              <button type="button" onClick={handleConfirmOverwriteParse}>
+                {isZh ? '继续覆盖' : 'Replace'}
+              </button>
+              <button type="button" className="secondary" onClick={() => setOverwriteDialog(null)}>
+                {isZh ? '取消' : 'Cancel'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

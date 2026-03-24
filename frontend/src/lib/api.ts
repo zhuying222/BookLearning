@@ -106,6 +106,51 @@ export function parseSinglePage(data: {
   return request<ParsePageResponse>('/parse/page', { method: 'POST', body: JSON.stringify(data) })
 }
 
+export type FollowUpRecord = {
+  id: string
+  question: string
+  answer: string
+  created_at: string
+  updated_at: string
+}
+
+export type FollowUpResponse = {
+  pdf_hash: string
+  page_number: number
+  follow_up: FollowUpRecord
+  model_name: string
+  cost_info: ParseCostInfo | null
+}
+
+export function followUpPage(data: {
+  pdf_hash: string
+  page_number: number
+  image_base64: string
+  question: string
+  current_explanation: string
+  config_id?: string
+}) {
+  return request<FollowUpResponse>('/parse/follow-up', { method: 'POST', body: JSON.stringify(data) })
+}
+
+export function updateFollowUp(
+  pdfHash: string,
+  pageNumber: number,
+  followUpId: string,
+  data: { question: string; answer: string },
+) {
+  return request<FollowUpRecord>(`/parse/follow-up/${pdfHash}/${pageNumber}/${followUpId}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export function deleteFollowUp(pdfHash: string, pageNumber: number, followUpId: string) {
+  return request<{ ok: boolean }>(`/parse/follow-up/${pdfHash}/${pageNumber}/${followUpId}`, {
+    method: 'DELETE',
+  })
+}
+
 export function parseRange(data: {
   pdf_hash: string
   pages: number[]
@@ -145,7 +190,23 @@ export function loadAllCachedExplanations(pdfHash: string) {
   return request<{ pdf_hash: string; pages: Record<number, string>; page_costs: Record<number, ParseCostInfo> }>(`/parse/cache/${pdfHash}`)
 }
 
+export function loadSavedFollowUps(pdfHash: string) {
+  return request<{ pdf_hash: string; pages: Record<number, FollowUpRecord[]> }>(`/parse/follow-up/${pdfHash}`)
+}
+
 // Documents
+export type LibraryFolder = {
+  id: string
+  name: string
+  parent_id: string | null
+  created_at: string
+  updated_at: string
+  depth: number
+  child_folder_count: number
+  child_document_count: number
+  total_document_count: number
+}
+
 export type LibraryDocument = {
   id: string
   pdf_hash: string
@@ -158,7 +219,15 @@ export type LibraryDocument = {
   updated_at: string
   last_opened_at: string | null
   last_read_page: number
+  parent_folder_id: string | null
   cached_pages: number
+  folder_depth: number
+}
+
+export type LibrarySnapshot = {
+  folders: LibraryFolder[]
+  documents: LibraryDocument[]
+  max_folder_depth: number
 }
 
 export type DocumentImportResponse = {
@@ -166,24 +235,79 @@ export type DocumentImportResponse = {
   document: LibraryDocument
 }
 
-export function listDocuments() {
-  return request<LibraryDocument[]>('/documents/')
+export type NodeDeleteResponse = {
+  ok: boolean
+  removed_id: string
+  removed_type: 'document' | 'folder'
 }
 
-export function importDocument(file: File) {
+export function listLibrary() {
+  return request<LibrarySnapshot>('/documents/')
+}
+
+export async function listDocuments() {
+  const snapshot = await listLibrary()
+  return snapshot.documents
+}
+
+export function importDocument(file: File, parentFolderId?: string | null) {
   const body = new FormData()
   body.append('file', file)
+  if (parentFolderId) {
+    body.append('parent_folder_id', parentFolderId)
+  }
   return request<DocumentImportResponse>('/documents/import', {
     method: 'POST',
     body,
   })
 }
 
+export function createFolder(data: { name: string; parent_folder_id?: string | null }) {
+  return request<LibraryFolder>('/documents/folders', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export function renameFolder(folderId: string, name: string) {
+  return request<LibraryFolder>(`/documents/folders/${folderId}/rename`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function moveFolder(folderId: string, targetFolderId: string | null) {
+  return request<LibraryFolder>(`/documents/folders/${folderId}/move`, {
+    method: 'PATCH',
+    body: JSON.stringify({ target_folder_id: targetFolderId }),
+  })
+}
+
+export function deleteFolder(folderId: string, removeCache = false) {
+  return request<NodeDeleteResponse>(`/documents/folders/${folderId}?remove_cache=${removeCache ? 'true' : 'false'}`, {
+    method: 'DELETE',
+  })
+}
+
 export function deleteDocument(documentId: string, removeCache = true) {
-  return request<{ ok: boolean; document_id: string; remove_cache: boolean }>(
+  return request<NodeDeleteResponse>(
     `/documents/${documentId}?remove_cache=${removeCache ? 'true' : 'false'}`,
     { method: 'DELETE' },
   )
+}
+
+export function renameDocument(documentId: string, name: string) {
+  return request<LibraryDocument>(`/documents/${documentId}/rename`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function moveDocument(documentId: string, targetFolderId: string | null) {
+  return request<LibraryDocument>(`/documents/${documentId}/move`, {
+    method: 'PATCH',
+    body: JSON.stringify({ target_folder_id: targetFolderId }),
+  })
 }
 
 export function updateDocumentProgress(documentId: string, lastReadPage: number) {

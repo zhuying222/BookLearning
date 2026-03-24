@@ -9,6 +9,7 @@ const CAPTURE_HEIGHT_SCALE = 1.2
 const MIN_CAPTURE_HEIGHT = 920
 const MAX_CAPTURE_HEIGHT = 1180
 const SHEET_WIDTH_MULTIPLIER = 2.08
+const PDF_EXPORT_CHUNK_SIZE = 4
 
 type PageData = {
   pageNum: number
@@ -36,6 +37,20 @@ type SheetMetrics = {
   captureHeight: number
   pageWidthPt: number
   pageHeightPt: number
+}
+
+type PendingSheetUpload = {
+  imageBase64: string
+  pageSize: {
+    width: number
+    height: number
+  }
+}
+
+export type PdfExportProgress = {
+  phase: 'render' | 'upload' | 'finalize'
+  done: number
+  total: number
 }
 
 const MAX_BLOCK_COST = 900
@@ -97,49 +112,85 @@ export async function exportAsPdf(
   pageCount: number,
   exportScale: number,
   includeAllPages: boolean,
-  onProgress?: (done: number, total: number) => void,
+  onProgress?: (progress: PdfExportProgress) => void,
 ) {
   const pages = includeAllPages
     ? allPages(pageCount)
     : sortedParsedPages(explanations)
 
-  const sheets = await buildSheets(
-    pdfDocument,
-    explanations,
-    pages,
-    exportScale,
-    onProgress,
-  )
-  const total = Math.max(1, pages.length + sheets.length)
-  const sheetImagesBase64: string[] = []
-  const sheetPageSizes = sheets.map((sheet) => ({
-    width: sheet.pageWidthPt,
-    height: sheet.pageHeightPt,
-  }))
+  const sessionId = await createPdfExportSession(pdfFileName)
+  const pendingChunk: PendingSheetUpload[] = []
+  let chunkIndex = 0
+  let uploadedSheetCount = 0
 
-  for (let index = 0; index < sheets.length; index += 1) {
-    onProgress?.(pages.length + index, total)
-    sheetImagesBase64.push(await renderSheetToBase64(sheets[index]))
+  for (let index = 0; index < pages.length; index += 1) {
+    const pageNum = pages[index]
+    onProgress?.({
+      phase: 'render',
+      done: index,
+      total: Math.max(1, pages.length),
+    })
+
+    const image = await renderPdfPageToDataUrl(pdfDocument, pageNum, exportScale)
+    const explanation = explanations[pageNum]?.trim() || ''
+    const pageData: PageData = {
+      pageNum,
+      dataUrl: image.dataUrl,
+      explanation,
+      width: image.width,
+      height: image.height,
+    }
+    const pageSheets = await buildPageSheets(pageData, exportScale)
+
+    for (const sheet of pageSheets) {
+      pendingChunk.push({
+        imageBase64: await renderSheetToBase64(sheet),
+        pageSize: {
+          width: sheet.pageWidthPt,
+          height: sheet.pageHeightPt,
+        },
+      })
+
+      if (pendingChunk.length >= PDF_EXPORT_CHUNK_SIZE) {
+        uploadedSheetCount = await uploadPdfSheetChunk(sessionId, chunkIndex, pendingChunk)
+        chunkIndex += 1
+        pendingChunk.length = 0
+        onProgress?.({
+          phase: 'upload',
+          done: uploadedSheetCount,
+          total: 0,
+        })
+      }
+    }
   }
-  onProgress?.(total, total)
 
-  const response = await fetch(`${API_BASE}/export/pdf`, {
+  onProgress?.({
+    phase: 'render',
+    done: pages.length,
+    total: Math.max(1, pages.length),
+  })
+
+  if (pendingChunk.length > 0) {
+    uploadedSheetCount = await uploadPdfSheetChunk(sessionId, chunkIndex, pendingChunk)
+    onProgress?.({
+      phase: 'upload',
+      done: uploadedSheetCount,
+      total: 0,
+    })
+  }
+
+  onProgress?.({
+    phase: 'finalize',
+    done: uploadedSheetCount,
+    total: uploadedSheetCount,
+  })
+
+  const response = await fetch(`${API_BASE}/export/pdf/session/${sessionId}/finalize`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      pdf_file_name: pdfFileName,
-      pages,
-      page_images_base64: {},
-      explanations: Object.fromEntries(
-        Object.entries(explanations).map(([key, value]) => [String(key), value]),
-      ),
-      sheet_images_base64: sheetImagesBase64,
-      sheet_page_sizes: sheetPageSizes,
-    }),
   })
 
   if (!response.ok) {
-    throw new Error(await response.text())
+    throw new Error(await readErrorMessage(response))
   }
 
   const blob = await response.blob()
@@ -1233,6 +1284,61 @@ async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
   } finally {
     destroyMeasurementHost(host)
   }
+}
+
+async function createPdfExportSession(pdfFileName: string): Promise<string> {
+  const response = await fetch(`${API_BASE}/export/pdf/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      pdf_file_name: pdfFileName,
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response))
+  }
+
+  const data = await response.json() as { session_id?: string }
+  if (!data.session_id) {
+    throw new Error('Failed to create export session.')
+  }
+
+  return data.session_id
+}
+
+async function uploadPdfSheetChunk(
+  sessionId: string,
+  chunkIndex: number,
+  chunk: PendingSheetUpload[],
+): Promise<number> {
+  const response = await fetch(`${API_BASE}/export/pdf/session/${sessionId}/chunk`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chunk_index: chunkIndex,
+      sheet_images_base64: chunk.map((item) => item.imageBase64),
+      sheet_page_sizes: chunk.map((item) => item.pageSize),
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response))
+  }
+
+  const data = await response.json() as { sheet_count?: number }
+  return Number(data.sheet_count ?? 0)
+}
+
+async function readErrorMessage(response: Response): Promise<string> {
+  const contentType = response.headers.get('Content-Type') || ''
+  if (contentType.includes('application/json')) {
+    const data = await response.json() as { detail?: string }
+    return data.detail || `Request failed with status ${response.status}`
+  }
+
+  const text = await response.text()
+  return text || `Request failed with status ${response.status}`
 }
 
 async function waitForCaptureReady(root: HTMLElement): Promise<void> {

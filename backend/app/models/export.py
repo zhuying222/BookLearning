@@ -8,3 +8,17 @@ class ExportPdfRequest(BaseModel):
     explanations: dict[str, str] = Field(default_factory=dict)
     sheet_images_base64: list[str] = Field(default_factory=list)
     sheet_page_sizes: list[dict[str, float]] = Field(default_factory=list)
+
+
+class ExportPdfSessionCreateRequest(BaseModel):
+    pdf_file_name: str
+
+
+class ExportPdfSessionCreateResponse(BaseModel):
+    session_id: str
+
+
+class ExportPdfChunkRequest(BaseModel):
+    chunk_index: int = Field(ge=0)
+    sheet_images_base64: list[str] = Field(min_length=1)
+    sheet_page_sizes: list[dict[str, float]] = Field(default_factory=list)

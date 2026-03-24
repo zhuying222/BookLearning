@@ -37,6 +37,41 @@ class ParsePageResponse(BaseModel):
     cost_info: ParseCostInfo | None = None
 
 
+class FollowUpRecord(BaseModel):
+    id: str
+    question: str
+    answer: str
+    created_at: str
+    updated_at: str
+
+
+class FollowUpRequest(BaseModel):
+    pdf_hash: str
+    page_number: int
+    image_base64: str
+    question: str
+    current_explanation: str
+    config_id: str | None = None
+
+
+class FollowUpResponse(BaseModel):
+    pdf_hash: str
+    page_number: int
+    follow_up: FollowUpRecord
+    model_name: str
+    cost_info: ParseCostInfo | None = None
+
+
+class UpdateFollowUpRequest(BaseModel):
+    question: str
+    answer: str
+
+
+class FollowUpPagesResponse(BaseModel):
+    pdf_hash: str
+    pages: dict[int, list[FollowUpRecord]] = {}
+
+
 class TaskStatusResponse(BaseModel):
     task_id: str
     status: str  # pending, running, paused, completed, cancelled, failed

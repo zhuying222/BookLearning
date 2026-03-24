@@ -27,14 +27,18 @@ async def call_vision_model(
     image_base64: str,
     page_prompt: str | None = None,
     context_summary: str | None = None,
+    extra_system_prompt: str | None = None,
+    user_text_override: str | None = None,
 ) -> tuple[str, CostInfo | None]:
     prompt_config = get_prompt_config()
 
     system_prompt = prompt_config.system_prompt
     if context_summary:
         system_prompt += f"\n\n前文摘要（供参考，保持讲解连贯）：\n{context_summary}"
+    if extra_system_prompt:
+        system_prompt += f"\n\n{extra_system_prompt}"
 
-    user_text = page_prompt or prompt_config.user_prompt_template
+    user_text = user_text_override or page_prompt or prompt_config.user_prompt_template
 
     messages = [
         {"role": "system", "content": system_prompt},

@@ -1,9 +1,12 @@
 import base64
 import io
+import json
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -51,23 +54,39 @@ class LineEntry:
     gap_before: float = 0
 
 
+@dataclass
+class ExportSession:
+    session_id: str
+    session_dir: Path
+    manifest_path: Path
+    sheets_dir: Path
+
+
 def generate_study_pdf(
     pdf_file_name: str,
     pages: list[int],
     page_images_base64: dict[str, str],
     explanations: dict[str, str],
     sheet_images_base64: list[str] | None = None,
+    sheet_image_paths: list[str] | None = None,
     sheet_page_sizes: list[dict[str, float]] | None = None,
 ) -> tuple[bytes, str]:
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=PAGE_SIZE, pageCompression=1)
     pdf.setTitle(f"{pdf_file_name} - BookLearning 讲解")
 
-    if sheet_images_base64:
+    if sheet_images_base64 or sheet_image_paths:
         normalized_sheet_sizes = sheet_page_sizes or []
+        if sheet_image_paths:
+            sheet_sources = list(sheet_image_paths)
+        else:
+            sheet_sources = list(sheet_images_base64 or [])
 
-        for index, sheet_image_base64 in enumerate(sheet_images_base64):
-            image_bytes = base64.b64decode(sheet_image_base64)
+        for index, sheet_source in enumerate(sheet_sources):
+            if sheet_image_paths:
+                image_bytes = Path(sheet_source).read_bytes()
+            else:
+                image_bytes = base64.b64decode(sheet_source)
             page_size = normalized_sheet_sizes[index] if index < len(normalized_sheet_sizes) else {}
             page_width = float(page_size.get("width", PAGE_WIDTH))
             page_height = float(page_size.get("height", PAGE_HEIGHT))
@@ -122,6 +141,113 @@ def generate_study_pdf(
     output_path = Path(settings.exports_dir) / output_name
     output_path.write_bytes(pdf_bytes)
     return pdf_bytes, output_name
+
+
+def create_pdf_export_session(pdf_file_name: str) -> str:
+    cleanup_expired_pdf_export_sessions()
+    session_id = uuid4().hex
+    session = _session_paths(session_id)
+    session.sheets_dir.mkdir(parents=True, exist_ok=True)
+    _write_manifest(
+        session.manifest_path,
+        {
+            "session_id": session_id,
+            "pdf_file_name": pdf_file_name,
+            "created_at": datetime.now().isoformat(),
+            "next_chunk_index": 0,
+            "sheet_count": 0,
+            "sheets": [],
+        },
+    )
+    return session_id
+
+
+def append_pdf_export_chunk(
+    session_id: str,
+    chunk_index: int,
+    sheet_images_base64: list[str],
+    sheet_page_sizes: list[dict[str, float]],
+) -> int:
+    if len(sheet_page_sizes) not in (0, len(sheet_images_base64)):
+        raise ValueError("Sheet size metadata does not match uploaded sheet count.")
+
+    session = _session_paths(session_id)
+    manifest = _read_manifest(session.manifest_path)
+    expected_chunk_index = int(manifest.get("next_chunk_index", 0))
+    if chunk_index != expected_chunk_index:
+        raise ValueError(
+            f"Unexpected chunk index {chunk_index}, expected {expected_chunk_index}."
+        )
+
+    sheets = list(manifest.get("sheets", []))
+    start_index = int(manifest.get("sheet_count", 0))
+
+    for offset, sheet_image_base64 in enumerate(sheet_images_base64):
+        sheet_index = start_index + offset
+        file_name = f"sheet_{sheet_index:05d}.png"
+        image_path = session.sheets_dir / file_name
+        image_path.write_bytes(base64.b64decode(sheet_image_base64))
+        page_size = sheet_page_sizes[offset] if sheet_page_sizes else {}
+        sheets.append(
+            {
+                "file_name": file_name,
+                "width": float(page_size.get("width", PAGE_WIDTH)),
+                "height": float(page_size.get("height", PAGE_HEIGHT)),
+            }
+        )
+
+    manifest["sheets"] = sheets
+    manifest["sheet_count"] = len(sheets)
+    manifest["next_chunk_index"] = expected_chunk_index + 1
+    _write_manifest(session.manifest_path, manifest)
+    return len(sheets)
+
+
+def finalize_pdf_export_session(session_id: str) -> tuple[bytes, str, int]:
+    session = _session_paths(session_id)
+    manifest = _read_manifest(session.manifest_path)
+    sheets = list(manifest.get("sheets", []))
+    if not sheets:
+        raise ValueError("No export sheets were uploaded.")
+
+    try:
+        pdf_bytes, filename = generate_study_pdf(
+            pdf_file_name=str(manifest.get("pdf_file_name", "BookLearning")),
+            pages=[],
+            page_images_base64={},
+            explanations={},
+            sheet_image_paths=[
+                str(session.sheets_dir / str(item["file_name"]))
+                for item in sheets
+            ],
+            sheet_page_sizes=[
+                {
+                    "width": float(item.get("width", PAGE_WIDTH)),
+                    "height": float(item.get("height", PAGE_HEIGHT)),
+                }
+                for item in sheets
+            ],
+        )
+        return pdf_bytes, filename, len(sheets)
+    finally:
+        shutil.rmtree(session.session_dir, ignore_errors=True)
+
+
+def cleanup_expired_pdf_export_sessions(max_age_hours: int = 24) -> None:
+    root = Path(settings.export_sessions_dir)
+    if not root.exists():
+        return
+
+    expire_before = datetime.now().timestamp() - max_age_hours * 3600
+    for session_dir in root.iterdir():
+        if not session_dir.is_dir():
+            continue
+        try:
+            modified_at = session_dir.stat().st_mtime
+        except OSError:
+            continue
+        if modified_at < expire_before:
+            shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def draw_source_page(
@@ -623,6 +749,30 @@ def _format_text(content: str) -> str:
 def _ensure_fonts() -> None:
     if FONT_CJK not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(UnicodeCIDFont(FONT_CJK))
+
+
+def _session_paths(session_id: str) -> ExportSession:
+    session_dir = Path(settings.export_sessions_dir) / session_id
+    return ExportSession(
+        session_id=session_id,
+        session_dir=session_dir,
+        manifest_path=session_dir / "manifest.json",
+        sheets_dir=session_dir / "sheets",
+    )
+
+
+def _read_manifest(manifest_path: Path) -> dict:
+    if not manifest_path.exists():
+        raise ValueError("Export session not found or has expired.")
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _write_manifest(manifest_path: Path, manifest: dict) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def export_timestamp_tag() -> str:

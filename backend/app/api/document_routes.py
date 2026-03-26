@@ -2,6 +2,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from app.models.document import (
+    DocumentBookmarkUpdate,
     DocumentImportResponse,
     DocumentMoveRequest,
     DocumentProgressUpdate,
@@ -125,6 +126,28 @@ def get_document_file(document_id: str):
 @router.patch("/{document_id}/progress", response_model=DocumentSummary)
 def update_progress(document_id: str, body: DocumentProgressUpdate):
     document = document_service.update_reading_progress(document_id, body.last_read_page)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
+
+
+@router.patch("/{document_id}/bookmarks/{page_number}", response_model=DocumentSummary)
+def update_bookmark(document_id: str, page_number: int, body: DocumentBookmarkUpdate):
+    try:
+        document = document_service.update_document_bookmark(document_id, page_number, body.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
+
+
+@router.delete("/{document_id}/bookmarks/{page_number}", response_model=DocumentSummary)
+def delete_bookmark(document_id: str, page_number: int):
+    try:
+        document = document_service.delete_document_bookmark(document_id, page_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
     return document

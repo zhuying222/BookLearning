@@ -222,6 +222,7 @@ export type LibraryDocument = {
   parent_folder_id: string | null
   cached_pages: number
   folder_depth: number
+  bookmarks: Record<number, string>
 }
 
 export type LibrarySnapshot = {
@@ -314,6 +315,19 @@ export function updateDocumentProgress(documentId: string, lastReadPage: number)
   return request<LibraryDocument>(`/documents/${documentId}/progress`, {
     method: 'PATCH',
     body: JSON.stringify({ last_read_page: lastReadPage }),
+  })
+}
+
+export function updateDocumentBookmark(documentId: string, pageNumber: number, text: string) {
+  return request<LibraryDocument>(`/documents/${documentId}/bookmarks/${pageNumber}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ text }),
+  })
+}
+
+export function deleteDocumentBookmark(documentId: string, pageNumber: number) {
+  return request<LibraryDocument>(`/documents/${documentId}/bookmarks/${pageNumber}`, {
+    method: 'DELETE',
   })
 }
 

@@ -22,7 +22,7 @@ from app.services import cache_service
 logger = logging.getLogger(__name__)
 
 MAX_FOLDER_DEPTH = 5
-_INDEX_VERSION = 2
+_INDEX_VERSION = 3
 _INVALID_FILE_NAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
 _WINDOWS_RESERVED_NAMES = {
     "con",
@@ -767,6 +767,70 @@ def update_reading_progress(document_id: str, last_read_page: int) -> DocumentSu
         updated_document = document.model_copy(
             update={
                 "last_read_page": max(1, last_read_page),
+                "last_opened_at": now,
+                "updated_at": now,
+            }
+        )
+        index.documents[position] = updated_document
+        break
+
+    if updated_document is None:
+        return None
+
+    _save_library(index)
+    folders_by_id = {folder.id: folder for folder in index.folders}
+    return _summarize_document(updated_document, folders_by_id)
+
+
+def update_document_bookmark(document_id: str, page_number: int, text: str) -> DocumentSummary | None:
+    index = _load_library()
+    updated_document: DocumentRecord | None = None
+    now = _utc_now()
+
+    for position, document in enumerate(index.documents):
+        if document.id != document_id:
+            continue
+        if page_number < 1:
+            raise ValueError("Bookmark page number must be at least 1.")
+        if document.page_count is not None and page_number > document.page_count:
+            raise ValueError("Bookmark page number exceeds the document page count.")
+
+        next_bookmarks = dict(document.bookmarks)
+        next_bookmarks[page_number] = text
+        updated_document = document.model_copy(
+            update={
+                "bookmarks": next_bookmarks,
+                "last_opened_at": now,
+                "updated_at": now,
+            }
+        )
+        index.documents[position] = updated_document
+        break
+
+    if updated_document is None:
+        return None
+
+    _save_library(index)
+    folders_by_id = {folder.id: folder for folder in index.folders}
+    return _summarize_document(updated_document, folders_by_id)
+
+
+def delete_document_bookmark(document_id: str, page_number: int) -> DocumentSummary | None:
+    index = _load_library()
+    updated_document: DocumentRecord | None = None
+    now = _utc_now()
+
+    for position, document in enumerate(index.documents):
+        if document.id != document_id:
+            continue
+        if page_number < 1:
+            raise ValueError("Bookmark page number must be at least 1.")
+
+        next_bookmarks = dict(document.bookmarks)
+        next_bookmarks.pop(page_number, None)
+        updated_document = document.model_copy(
+            update={
+                "bookmarks": next_bookmarks,
                 "last_opened_at": now,
                 "updated_at": now,
             }

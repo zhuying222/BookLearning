@@ -6,11 +6,13 @@ import './App.css'
 import AiConfigPanel from './components/AiConfigPanel'
 import Bookshelf from './components/Bookshelf'
 import ExplanationPanel from './components/ExplanationPanel'
+import ParseNotificationCenter, { type ParseNotification, type ParseNotificationKind } from './components/ParseNotificationCenter'
 import ParseControls from './components/ParseControls'
 import PromptEditor from './components/PromptEditor'
 import type { FollowUpRecord, LibraryDocument, LibraryFolder, TaskStatus } from './lib/api'
 import {
   createFolder,
+  deleteDocumentBookmark,
   deleteFolder,
   deleteDocument,
   downloadDocumentPdf,
@@ -26,9 +28,18 @@ import {
   parseSinglePage,
   renameDocument,
   renameFolder,
+  updateDocumentBookmark,
   updateDocumentProgress,
 } from './lib/api'
-import { exportAsHtml, exportAsJson, exportAsPdf } from './lib/export'
+import {
+  DEFAULT_EXPORT_EXPLANATION_FONT_SIZE,
+  MAX_EXPORT_EXPLANATION_FONT_SIZE,
+  MIN_EXPORT_EXPLANATION_FONT_SIZE,
+  exportAsHtml,
+  exportAsJson,
+  exportAsPdf,
+  renderPdfExportPreview,
+} from './lib/export'
 import type { PdfExportProgress } from './lib/export'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
 import {
@@ -45,6 +56,7 @@ const MIN_VIEWER_RATIO = 12
 const MAX_VIEWER_RATIO = 88
 const MIN_RIGHT_TOP_RATIO = 18
 const MAX_RIGHT_TOP_RATIO = 92
+const PARSE_NOTIFICATION_DURATION_MS = 10000
 
 type Locale = 'zh' | 'en'
 type ViewMode = 'library' | 'reader'
@@ -59,6 +71,30 @@ type StatusState =
   | { key: 'parsing'; page: number }
   | { key: 'parsed'; page: number }
   | { key: 'parseFailed'; error: string }
+
+function resolvePdfExportPreviewPage(
+  currentPage: number,
+  explanations: Record<number, string>,
+  pageCount: number,
+): number | null {
+  if (currentPage >= 1 && currentPage <= pageCount && explanations[currentPage]?.trim()) {
+    return currentPage
+  }
+
+  const parsedPages = Object.keys(explanations)
+    .map(Number)
+    .filter((pageNum) => explanations[pageNum]?.trim())
+    .sort((a, b) => a - b)
+
+  return parsedPages[0] ?? null
+}
+
+function resolveTaskResultPages(results: Record<number, string>): number[] {
+  return Object.keys(results)
+    .map(Number)
+    .filter((pageNumber) => Number.isFinite(pageNumber))
+    .sort((left, right) => left - right)
+}
 
 function getStatusText(locale: Locale, status: StatusState): string {
   switch (status.key) {
@@ -111,6 +147,10 @@ function App() {
   const [loadError, setLoadError] = useState('')
   const [renderError, setRenderError] = useState('')
   const [isLoadingPdf, setIsLoadingPdf] = useState(false)
+  const [bookmarkError, setBookmarkError] = useState('')
+  const [bookmarkDraft, setBookmarkDraft] = useState('')
+  const [bookmarkEditorPage, setBookmarkEditorPage] = useState<number | null>(null)
+  const [isBookmarkSaving, setIsBookmarkSaving] = useState(false)
 
   // AI & Parse state
   const [showAiConfig, setShowAiConfig] = useState(false)
@@ -125,12 +165,18 @@ function App() {
   const [followUps, setFollowUps] = useState<Record<number, FollowUpRecord[]>>({})
   const [followUpDrafts, setFollowUpDrafts] = useState<Record<number, string>>({})
   const [followUpModePage, setFollowUpModePage] = useState<number | null>(null)
+  const [parseNotifications, setParseNotifications] = useState<ParseNotification[]>([])
   const [skipOverwritePrompt, setSkipOverwritePrompt] = useState(false)
   const [overwriteDialog, setOverwriteDialog] = useState<OverwriteDialogState>(null)
   const [skipOverwritePromptChecked, setSkipOverwritePromptChecked] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const [exportProgress, setExportProgress] = useState('')
   const [exportAllPages, setExportAllPages] = useState(false)
+  const [exportExplanationFontSize, setExportExplanationFontSize] = useState(DEFAULT_EXPORT_EXPLANATION_FONT_SIZE)
+  const [pdfExportPreviewPage, setPdfExportPreviewPage] = useState<number | null>(null)
+  const [pdfExportPreviewImage, setPdfExportPreviewImage] = useState('')
+  const [pdfExportPreviewError, setPdfExportPreviewError] = useState('')
+  const [isPdfExportPreviewLoading, setIsPdfExportPreviewLoading] = useState(false)
 
   const activeDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -139,6 +185,9 @@ function App() {
   const rightPanelRef = useRef<HTMLElement | null>(null)
   const taskPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const documentLoadSeqRef = useRef(0)
+  const pdfExportPreviewSeqRef = useRef(0)
+  const parseNotificationSeqRef = useRef(0)
+  const completedTaskToastIdsRef = useRef(new Set<string>())
 
   const isZh = locale === 'zh'
   const statusText = useMemo(() => getStatusText(locale, status), [locale, status])
@@ -157,6 +206,16 @@ function App() {
   const currentFollowUpDraft = followUpDrafts[currentPage] ?? ''
   const isCurrentPageFollowUpMode = followUpModePage === currentPage
   const currentPageExplanation = explanations[currentPage]?.trim() ?? ''
+  const activeTaskId = activeTask?.task_id ?? null
+  const activeTaskStatus = activeTask?.status ?? null
+  const currentDocumentBookmarks = currentDocumentMeta?.bookmarks ?? {}
+  const isCurrentPageBookmarked = Object.prototype.hasOwnProperty.call(currentDocumentBookmarks, currentPage)
+  const currentPageBookmarkText = currentDocumentBookmarks[currentPage] ?? ''
+  const isBookmarkEditorOpen = bookmarkEditorPage === currentPage && isCurrentPageBookmarked
+  const exportLayoutOptions = useMemo(
+    () => ({ explanationFontSizePx: exportExplanationFontSize }),
+    [exportExplanationFontSize],
+  )
   const configuredPromptCount = useMemo(
     () => Object.values(pagePrompts).filter((value) => value.trim()).length,
     [pagePrompts],
@@ -189,6 +248,34 @@ function App() {
     })
   }, [])
 
+  const clearParseNotifications = useCallback(() => {
+    setParseNotifications([])
+  }, [])
+
+  const dismissParseNotification = useCallback((id: string) => {
+    setParseNotifications((prev) => prev.filter((notification) => notification.id !== id))
+  }, [])
+
+  const enqueueParseNotification = useCallback((
+    kind: ParseNotificationKind,
+    pages: number[],
+    targetPage: number | null,
+  ) => {
+    if (pages.length === 0) return
+
+    parseNotificationSeqRef.current += 1
+    setParseNotifications((prev) => [
+      ...prev,
+      {
+        id: `parse-notice-${parseNotificationSeqRef.current}`,
+        kind,
+        pages,
+        targetPage,
+        durationMs: PARSE_NOTIFICATION_DURATION_MS,
+      },
+    ])
+  }, [])
+
   const resetReaderState = useCallback(() => {
     if (activeDocumentRef.current) {
       void activeDocumentRef.current.destroy()
@@ -207,11 +294,19 @@ function App() {
     setFollowUps({})
     setFollowUpDrafts({})
     setFollowUpModePage(null)
+    clearParseNotifications()
     setOverwriteDialog(null)
     setSkipOverwritePromptChecked(false)
     setActiveTask(null)
+    setPdfExportPreviewPage(null)
+    setPdfExportPreviewImage('')
+    setPdfExportPreviewError('')
+    setIsPdfExportPreviewLoading(false)
     setStatus({ key: 'idle' })
-  }, [])
+    setBookmarkError('')
+    setBookmarkDraft('')
+    setBookmarkEditorPage(null)
+  }, [clearParseNotifications])
 
   const refreshLibraryDocuments = useCallback(async (silent = false) => {
     if (!silent) {
@@ -262,6 +357,11 @@ function App() {
     setOverwriteDialog(null)
     setSkipOverwritePromptChecked(false)
   }, [currentPage])
+
+  useEffect(() => {
+    setBookmarkEditorPage(null)
+    setBookmarkDraft(currentPageBookmarkText)
+  }, [currentPage, currentPageBookmarkText])
 
   useEffect(() => {
     if (viewMode !== 'reader' || !currentDocumentMeta || pageCount === 0) return
@@ -367,7 +467,7 @@ function App() {
 
   // Poll active task
   useEffect(() => {
-    if (!activeTask || (activeTask.status !== 'pending' && activeTask.status !== 'running' && activeTask.status !== 'paused')) {
+    if (!activeTaskId || (activeTaskStatus !== 'pending' && activeTaskStatus !== 'running' && activeTaskStatus !== 'paused')) {
       if (taskPollRef.current) {
         clearInterval(taskPollRef.current)
         taskPollRef.current = null
@@ -377,7 +477,7 @@ function App() {
 
     const pollTaskStatus = async () => {
       try {
-        const updated = await getTaskStatus(activeTask.task_id)
+        const updated = await getTaskStatus(activeTaskId)
         setActiveTask(updated)
         if (updated.results) {
           setExplanations((prev) => ({ ...prev, ...updated.results }))
@@ -390,6 +490,13 @@ function App() {
               }
               setFollowUps(mapped)
             }
+          }
+        }
+        if (updated.status === 'completed' && !completedTaskToastIdsRef.current.has(updated.task_id)) {
+          const completedPages = resolveTaskResultPages(updated.results)
+          if (completedPages.length > 0) {
+            completedTaskToastIdsRef.current.add(updated.task_id)
+            enqueueParseNotification('batch', completedPages, completedPages[0] ?? null)
           }
         }
         if (updated.status !== 'pending' && updated.status !== 'running' && updated.status !== 'paused') {
@@ -412,7 +519,7 @@ function App() {
         taskPollRef.current = null
       }
     }
-  }, [activeTask?.task_id, activeTask?.status, pdfHash])
+  }, [activeTaskId, activeTaskStatus, enqueueParseNotification, pdfHash])
 
   const openLibraryDocument = useCallback(async (document: LibraryDocument) => {
     const requestSeq = documentLoadSeqRef.current + 1
@@ -423,6 +530,7 @@ function App() {
     setIsLoadingPdf(true)
     setLoadError('')
     setRenderError('')
+    setBookmarkError('')
     setParseError('')
     setExplanations({})
     setParsingPages([])
@@ -430,12 +538,15 @@ function App() {
     setFollowUps({})
     setFollowUpDrafts({})
     setFollowUpModePage(null)
+    clearParseNotifications()
     setOverwriteDialog(null)
     setSkipOverwritePromptChecked(false)
     setActiveTask(null)
     setBatchRangeInput('')
     setBatchPreparationStatus('')
     setExportProgress('')
+    setBookmarkDraft('')
+    setBookmarkEditorPage(null)
     setPdfDocument(null)
     setPdfHash(document.pdf_hash)
     setPdfFileName(document.original_file_name)
@@ -508,7 +619,7 @@ function App() {
         setIsLoadingPdf(false)
       }
     }
-  }, [syncDocumentIntoShelf])
+  }, [clearParseNotifications, syncDocumentIntoShelf])
 
   const isFolderWithin = useCallback((folderId: string | null, ancestorId: string) => {
     let current = folderId
@@ -686,6 +797,7 @@ function App() {
 
   const handleBackToLibrary = useCallback(() => {
     setViewMode('library')
+    clearParseNotifications()
     if (currentDocumentMeta && pageCount > 0) {
       void updateDocumentProgress(currentDocumentMeta.id, currentPage)
         .then((updated) => {
@@ -694,12 +806,19 @@ function App() {
         .catch(() => { /* ignore progress sync errors */ })
     }
     void refreshLibraryDocuments(true)
-  }, [currentDocumentMeta, currentPage, pageCount, refreshLibraryDocuments, syncDocumentIntoShelf])
+  }, [clearParseNotifications, currentDocumentMeta, currentPage, pageCount, refreshLibraryDocuments, syncDocumentIntoShelf])
 
-  const goToPage = (pageNumber: number) => {
+  const goToPage = useCallback((pageNumber: number) => {
     if (!pdfDocument || pageCount === 0) return
     setCurrentPage(clamp(pageNumber, 1, pageCount))
-  }
+  }, [pageCount, pdfDocument])
+
+  const handleActivateParseNotification = useCallback((id: string, targetPage: number | null) => {
+    dismissParseNotification(id)
+    if (typeof targetPage === 'number') {
+      goToPage(targetPage)
+    }
+  }, [dismissParseNotification, goToPage])
 
   const handleJumpSubmit = () => {
     const targetPage = Number.parseInt(jumpInput, 10)
@@ -713,6 +832,50 @@ function App() {
   const changeScale = (delta: number) => {
     setScale((p) => clamp(Number((p + delta).toFixed(2)), MIN_SCALE, MAX_SCALE))
   }
+
+  const handleToggleBookmark = useCallback(async (checked: boolean) => {
+    if (!currentDocumentMeta || pageCount === 0) return
+    setBookmarkError('')
+    setIsBookmarkSaving(true)
+    try {
+      const updated = checked
+        ? await updateDocumentBookmark(currentDocumentMeta.id, currentPage, currentPageBookmarkText)
+        : await deleteDocumentBookmark(currentDocumentMeta.id, currentPage)
+      syncDocumentIntoShelf(updated)
+      if (!checked) {
+        setBookmarkEditorPage(null)
+        setBookmarkDraft('')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (isZh ? '书签保存失败。' : 'Failed to save bookmark.')
+      setBookmarkError(message)
+    } finally {
+      setIsBookmarkSaving(false)
+    }
+  }, [currentDocumentMeta, currentPage, currentPageBookmarkText, isZh, pageCount, syncDocumentIntoShelf])
+
+  const handleToggleBookmarkEditor = useCallback(() => {
+    if (!isCurrentPageBookmarked) return
+    setBookmarkError('')
+    setBookmarkDraft(currentPageBookmarkText)
+    setBookmarkEditorPage((prev) => (prev === currentPage ? null : currentPage))
+  }, [currentPage, currentPageBookmarkText, isCurrentPageBookmarked])
+
+  const handleSaveBookmarkText = useCallback(async () => {
+    if (!currentDocumentMeta || !isCurrentPageBookmarked) return
+    setBookmarkError('')
+    setIsBookmarkSaving(true)
+    try {
+      const updated = await updateDocumentBookmark(currentDocumentMeta.id, currentPage, bookmarkDraft)
+      syncDocumentIntoShelf(updated)
+      setBookmarkDraft(updated.bookmarks[currentPage] ?? '')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (isZh ? '书签内容保存失败。' : 'Failed to save bookmark text.')
+      setBookmarkError(message)
+    } finally {
+      setIsBookmarkSaving(false)
+    }
+  }, [bookmarkDraft, currentDocumentMeta, currentPage, isCurrentPageBookmarked, isZh, syncDocumentIntoShelf])
 
   const handleViewerWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (!event.ctrlKey && !event.metaKey) return
@@ -748,6 +911,7 @@ function App() {
           current_explanation: currentPageExplanation,
         })
         applyFollowUpsToPage(pageToParse, [...(followUps[pageToParse] ?? []), result.follow_up])
+        enqueueParseNotification('follow-up', [pageToParse], pageToParse)
       } else {
         const result = await parseSinglePage({
           pdf_hash: pdfHash,
@@ -757,6 +921,7 @@ function App() {
           force: forceExplanationOverwrite,
         })
         setExplanations((prev) => ({ ...prev, [pageToParse]: result.explanation }))
+        enqueueParseNotification('page', [pageToParse], pageToParse)
       }
       setStatus({ key: 'parsed', page: pageToParse })
     } catch (error) {
@@ -772,6 +937,7 @@ function App() {
     currentPage,
     currentPageExplanation,
     currentPagePrompt,
+    enqueueParseNotification,
     followUps,
     isCurrentPageFollowUpMode,
     isZh,
@@ -901,6 +1067,41 @@ function App() {
     })
   }, [currentPage, isCurrentPageFollowUpMode])
 
+  useEffect(() => {
+    if (!pdfDocument || pdfExportPreviewPage === null) {
+      return
+    }
+
+    const requestId = pdfExportPreviewSeqRef.current + 1
+    pdfExportPreviewSeqRef.current = requestId
+    setIsPdfExportPreviewLoading(true)
+    setPdfExportPreviewError('')
+
+    void renderPdfExportPreview(
+      pdfDocument,
+      pdfExportPreviewPage,
+      explanations[pdfExportPreviewPage] ?? '',
+      DEFAULT_EXPORT_SCALE,
+      exportLayoutOptions,
+    ).then((imageUrl) => {
+      if (pdfExportPreviewSeqRef.current !== requestId) {
+        return
+      }
+
+      setPdfExportPreviewImage(imageUrl)
+      setIsPdfExportPreviewLoading(false)
+    }).catch((error) => {
+      if (pdfExportPreviewSeqRef.current !== requestId) {
+        return
+      }
+
+      const message = error instanceof Error ? error.message : 'Failed to render PDF export preview.'
+      setPdfExportPreviewImage('')
+      setPdfExportPreviewError(message)
+      setIsPdfExportPreviewLoading(false)
+    })
+  }, [exportLayoutOptions, explanations, pdfDocument, pdfExportPreviewPage])
+
   const handleToggleCurrentPageInBatch = useCallback((checked: boolean) => {
     if (pageCount === 0) return
 
@@ -915,6 +1116,7 @@ function App() {
   }, [currentPage, pageCount, selectedBatchPages])
 
   const hasExplanations = Object.keys(explanations).length > 0
+  const isPdfExportPreviewOpen = pdfExportPreviewPage !== null
   const isPrimaryActionDisabled = !pdfDocument
     || isCurrentPageParsing
     || (isCurrentPageFollowUpMode && (!currentPageExplanation || !currentFollowUpDraft.trim()))
@@ -929,9 +1131,18 @@ function App() {
     setIsExporting(true)
     setExportProgress(isZh ? '准备导出...' : 'Preparing...')
     try {
-      await exportAsHtml(pdfDocument, pdfFileName, explanations, pageCount, DEFAULT_EXPORT_SCALE, exportAllPages, (done, total) => {
-        setExportProgress(isZh ? `渲染页面 ${done}/${total}...` : `Rendering ${done}/${total}...`)
-      })
+      await exportAsHtml(
+        pdfDocument,
+        pdfFileName,
+        explanations,
+        pageCount,
+        DEFAULT_EXPORT_SCALE,
+        exportAllPages,
+        exportLayoutOptions,
+        (done, total) => {
+          setExportProgress(isZh ? `渲染页面 ${done}/${total}...` : `Rendering ${done}/${total}...`)
+        },
+      )
       setExportProgress(isZh ? '导出完成' : 'Done')
     } catch (e) {
       setExportProgress(isZh ? `导出失败：${e}` : `Failed: ${e}`)
@@ -939,29 +1150,46 @@ function App() {
       setIsExporting(false)
       setTimeout(() => setExportProgress(''), 3000)
     }
-  }, [pdfDocument, pdfFileName, explanations, pageCount, hasExplanations, isZh, exportAllPages])
+  }, [exportAllPages, exportLayoutOptions, explanations, hasExplanations, isZh, pageCount, pdfDocument, pdfFileName])
 
-  const handleExportPdf = useCallback(async () => {
+  const closePdfExportPreview = useCallback(() => {
+    pdfExportPreviewSeqRef.current += 1
+    setPdfExportPreviewPage(null)
+    setPdfExportPreviewImage('')
+    setPdfExportPreviewError('')
+    setIsPdfExportPreviewLoading(false)
+  }, [])
+
+  const runPdfExport = useCallback(async () => {
     if (!pdfDocument || !hasExplanations) return
     setIsExporting(true)
     setExportProgress(isZh ? '准备导出...' : 'Preparing...')
     try {
-      await exportAsPdf(pdfDocument, pdfFileName, explanations, pageCount, DEFAULT_EXPORT_SCALE, exportAllPages, (progress: PdfExportProgress) => {
-        if (progress.phase === 'render') {
-          setExportProgress(isZh ? `渲染页面 ${progress.done}/${progress.total}...` : `Rendering ${progress.done}/${progress.total}...`)
-          return
-        }
+      await exportAsPdf(
+        pdfDocument,
+        pdfFileName,
+        explanations,
+        pageCount,
+        DEFAULT_EXPORT_SCALE,
+        exportAllPages,
+        exportLayoutOptions,
+        (progress: PdfExportProgress) => {
+          if (progress.phase === 'render') {
+            setExportProgress(isZh ? `渲染页面 ${progress.done}/${progress.total}...` : `Rendering ${progress.done}/${progress.total}...`)
+            return
+          }
 
-        if (progress.phase === 'upload') {
-          const uploadedText = progress.total > 0
-            ? `${progress.done}/${progress.total}`
-            : `${progress.done}`
-          setExportProgress(isZh ? `上传导出页 ${uploadedText}...` : `Uploading sheets ${uploadedText}...`)
-          return
-        }
+          if (progress.phase === 'upload') {
+            const uploadedText = progress.total > 0
+              ? `${progress.done}/${progress.total}`
+              : `${progress.done}`
+            setExportProgress(isZh ? `上传导出页 ${uploadedText}...` : `Uploading sheets ${uploadedText}...`)
+            return
+          }
 
-        setExportProgress(isZh ? '正在合成 PDF...' : 'Finalizing PDF...')
-      })
+          setExportProgress(isZh ? '正在合成 PDF...' : 'Finalizing PDF...')
+        },
+      )
       setExportProgress(isZh ? '导出完成' : 'Export complete')
     } catch (e) {
       setExportProgress(isZh ? `导出失败：${e}` : `Failed: ${e}`)
@@ -969,12 +1197,34 @@ function App() {
       setIsExporting(false)
       setTimeout(() => setExportProgress(''), 5000)
     }
-  }, [pdfDocument, pdfFileName, explanations, pageCount, hasExplanations, isZh, exportAllPages])
+  }, [exportAllPages, exportLayoutOptions, explanations, hasExplanations, isZh, pageCount, pdfDocument, pdfFileName])
+
+  const handleExportPdf = useCallback(() => {
+    const previewPage = resolvePdfExportPreviewPage(currentPage, explanations, pageCount)
+    if (!pdfDocument || !hasExplanations || previewPage === null) return
+
+    pdfExportPreviewSeqRef.current += 1
+    setPdfExportPreviewPage(previewPage)
+    setPdfExportPreviewImage('')
+    setPdfExportPreviewError('')
+    setIsPdfExportPreviewLoading(true)
+  }, [currentPage, explanations, hasExplanations, pageCount, pdfDocument])
+
+  const handleConfirmPdfExport = useCallback(() => {
+    closePdfExportPreview()
+    void runPdfExport()
+  }, [closePdfExportPreview, runPdfExport])
 
   return (
     <div className="app-shell">
       {showAiConfig && <AiConfigPanel locale={locale} onClose={() => setShowAiConfig(false)} />}
       {showPromptEditor && <PromptEditor locale={locale} onClose={() => setShowPromptEditor(false)} />}
+      <ParseNotificationCenter
+        locale={locale}
+        notifications={parseNotifications}
+        onDismiss={dismissParseNotification}
+        onActivate={handleActivateParseNotification}
+      />
 
       <header className="top-bar">
         <div className="top-bar-left">
@@ -1046,12 +1296,14 @@ function App() {
         >
           <section className="viewer-pane">
             <div className="viewer-toolbar">
-              <span>{displayFileName}</span>
-              <span>
-                {isZh
-                  ? `第 ${currentPage} / ${pageCount || 0} 页`
-                  : `Page ${currentPage} / ${pageCount || 0}`}
-              </span>
+              <span className="viewer-toolbar__title">{displayFileName}</span>
+              <div className="viewer-toolbar__actions">
+                <span>
+                  {isZh
+                    ? `第 ${currentPage} / ${pageCount || 0} 页`
+                    : `Page ${currentPage} / ${pageCount || 0}`}
+                </span>
+              </div>
             </div>
             <div ref={viewerRef} className="single-page-stage" onWheel={handleViewerWheel}>
               {pageCount === 0 ? (
@@ -1093,11 +1345,21 @@ function App() {
                 isLoading={isCurrentPageParsing}
                 pageCount={pageCount}
                 pdfHash={pdfHash}
+                isCurrentPageBookmarked={isCurrentPageBookmarked}
+                currentPageBookmarkText={currentPageBookmarkText}
+                bookmarkDraft={bookmarkDraft}
+                isBookmarkEditorOpen={isBookmarkEditorOpen}
+                isBookmarkSaving={isBookmarkSaving}
                 onExplanationUpdate={(page, text) => {
                   setExplanations((prev) => ({ ...prev, [page]: text }))
                 }}
                 onFollowUpsUpdate={applyFollowUpsToPage}
                 onToggleFollowUpMode={handleToggleFollowUpMode}
+                onBookmarkDraftChange={setBookmarkDraft}
+                onToggleBookmark={(checked) => { void handleToggleBookmark(checked) }}
+                onToggleBookmarkEditor={handleToggleBookmarkEditor}
+                onCloseBookmarkEditor={() => setBookmarkEditorPage(null)}
+                onSaveBookmarkText={() => { void handleSaveBookmarkText() }}
               />
             </div>
 
@@ -1214,10 +1476,11 @@ function App() {
                   <span>{isLoadingPdf ? getStatusText(locale, { key: 'loadingPdf', fileName: pdfFileName }) : statusText}</span>
                 </div>
 
-                {(loadError || renderError || parseError) && (
+                {(loadError || renderError || bookmarkError || parseError) && (
                   <div className="control-banner control-banner--error">
                     {loadError && <p>{loadError}</p>}
                     {renderError && <p>{renderError}</p>}
+                    {bookmarkError && <p>{bookmarkError}</p>}
                     {parseError && <p>{parseError}</p>}
                   </div>
                 )}
@@ -1225,6 +1488,82 @@ function App() {
             </div>
           </aside>
         </main>
+      )}
+
+      {isPdfExportPreviewOpen && (
+        <div className="modal-overlay" onClick={closePdfExportPreview}>
+          <div className="modal-content modal-content--wide export-preview-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h3>{isZh ? 'PDF 导出预览' : 'PDF export preview'}</h3>
+                <p className="export-preview-subtitle">
+                  {isZh
+                    ? `仅预览第 ${pdfExportPreviewPage} 页导出效果。调好讲解字体后，再开始整份 PDF 渲染。`
+                    : `Previewing export sheet for page ${pdfExportPreviewPage}. Full PDF rendering starts only after confirmation.`}
+                </p>
+              </div>
+              <button type="button" className="modal-close" onClick={closePdfExportPreview}>×</button>
+            </div>
+
+            <div className="export-preview-toolbar">
+              <span className="export-preview-label">{isZh ? '讲解字体' : 'Explanation font'}</span>
+              <div className="explanation-font-controls" aria-label={isZh ? '导出讲解字体大小控制' : 'Export explanation font size controls'}>
+                <button
+                  type="button"
+                  onClick={() => setExportExplanationFontSize((prev) => Math.max(MIN_EXPORT_EXPLANATION_FONT_SIZE, prev - 1))}
+                  disabled={isExporting || exportExplanationFontSize <= MIN_EXPORT_EXPLANATION_FONT_SIZE}
+                  aria-label={isZh ? '减小导出讲解字体' : 'Decrease export explanation font size'}
+                >
+                  A-
+                </button>
+                <span>{exportExplanationFontSize}px</span>
+                <button
+                  type="button"
+                  onClick={() => setExportExplanationFontSize((prev) => Math.min(MAX_EXPORT_EXPLANATION_FONT_SIZE, prev + 1))}
+                  disabled={isExporting || exportExplanationFontSize >= MAX_EXPORT_EXPLANATION_FONT_SIZE}
+                  aria-label={isZh ? '增大导出讲解字体' : 'Increase export explanation font size'}
+                >
+                  A+
+                </button>
+              </div>
+            </div>
+
+            <div className="export-preview-stage">
+              {isPdfExportPreviewLoading ? (
+                <div className="export-preview-placeholder">
+                  <p>{isZh ? '正在生成单页预览...' : 'Rendering preview sheet...'}</p>
+                </div>
+              ) : pdfExportPreviewError ? (
+                <div className="export-preview-placeholder export-preview-placeholder--error">
+                  <p>{pdfExportPreviewError}</p>
+                </div>
+              ) : pdfExportPreviewImage ? (
+                <img
+                  className="export-preview-image"
+                  src={pdfExportPreviewImage}
+                  alt={isZh ? `第 ${pdfExportPreviewPage} 页导出预览` : `Export preview of page ${pdfExportPreviewPage}`}
+                />
+              ) : (
+                <div className="export-preview-placeholder">
+                  <p>{isZh ? '暂无预览图。' : 'No preview available.'}</p>
+                </div>
+              )}
+            </div>
+
+            <div className="button-row export-preview-actions">
+              <button
+                type="button"
+                onClick={handleConfirmPdfExport}
+                disabled={isExporting || isPdfExportPreviewLoading || Boolean(pdfExportPreviewError) || !pdfExportPreviewImage}
+              >
+                {isZh ? '继续导出 PDF' : 'Continue export'}
+              </button>
+              <button type="button" className="secondary" onClick={closePdfExportPreview} disabled={isExporting}>
+                {isZh ? '取消' : 'Cancel'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {overwriteDialog && (

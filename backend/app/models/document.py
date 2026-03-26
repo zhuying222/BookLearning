@@ -33,6 +33,7 @@ class DocumentRecord(BaseModel):
     last_opened_at: datetime | None = None
     last_read_page: int = 1
     parent_folder_id: str | None = None
+    bookmarks: dict[int, str] = Field(default_factory=dict)
 
 
 class DocumentSummary(DocumentRecord):
@@ -41,7 +42,7 @@ class DocumentSummary(DocumentRecord):
 
 
 class LibraryIndex(BaseModel):
-    version: int = 2
+    version: int = 3
     folders: list[FolderRecord] = Field(default_factory=list)
     documents: list[DocumentRecord] = Field(default_factory=list)
 
@@ -59,6 +60,10 @@ class DocumentImportResponse(BaseModel):
 
 class DocumentProgressUpdate(BaseModel):
     last_read_page: int
+
+
+class DocumentBookmarkUpdate(BaseModel):
+    text: str = ""
 
 
 class FolderCreateRequest(BaseModel):

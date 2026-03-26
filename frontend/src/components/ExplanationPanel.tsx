@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import 'katex/dist/katex.min.css'
 import type { FollowUpRecord } from '../lib/api'
@@ -18,9 +18,19 @@ type Props = {
   isLoading: boolean
   pageCount: number
   pdfHash: string
+  isCurrentPageBookmarked: boolean
+  currentPageBookmarkText: string
+  bookmarkDraft: string
+  isBookmarkEditorOpen: boolean
+  isBookmarkSaving: boolean
   onExplanationUpdate: (page: number, text: string) => void
   onFollowUpsUpdate: (page: number, items: FollowUpRecord[]) => void
   onToggleFollowUpMode: () => void
+  onBookmarkDraftChange: (value: string) => void
+  onToggleBookmark: (checked: boolean) => void
+  onToggleBookmarkEditor: () => void
+  onCloseBookmarkEditor: () => void
+  onSaveBookmarkText: () => void
 }
 
 type FollowUpMenuState = {
@@ -38,12 +48,23 @@ export default function ExplanationPanel({
   isLoading,
   pageCount,
   pdfHash,
+  isCurrentPageBookmarked,
+  currentPageBookmarkText,
+  bookmarkDraft,
+  isBookmarkEditorOpen,
+  isBookmarkSaving,
   onExplanationUpdate,
   onFollowUpsUpdate,
   onToggleFollowUpMode,
+  onBookmarkDraftChange,
+  onToggleBookmark,
+  onToggleBookmarkEditor,
+  onCloseBookmarkEditor,
+  onSaveBookmarkText,
 }: Props) {
   const isZh = locale === 'zh'
   const explanation = explanations[currentPage]
+  const bookmarkRef = useRef<HTMLDivElement | null>(null)
   const [isEditing, setIsEditing] = useState(false)
   const [editText, setEditText] = useState('')
   const [isSaving, setIsSaving] = useState(false)
@@ -80,6 +101,26 @@ export default function ExplanationPanel({
       window.removeEventListener('scroll', closeMenu, true)
     }
   }, [followUpMenu])
+
+  useEffect(() => {
+    if (!isBookmarkEditorOpen) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (bookmarkRef.current && event.target instanceof Node && !bookmarkRef.current.contains(event.target)) {
+        onCloseBookmarkEditor()
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onCloseBookmarkEditor()
+      }
+    }
+    window.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isBookmarkEditorOpen, onCloseBookmarkEditor])
 
   useEffect(() => {
     if (!editingFollowUpId) return
@@ -232,6 +273,15 @@ export default function ExplanationPanel({
           )}
         </div>
         <div className="explanation-header-right">
+          <label className="ctrl-check ctrl-check--pill explanation-bookmark-toggle">
+            <input
+              type="checkbox"
+              checked={isCurrentPageBookmarked}
+              onChange={(event) => onToggleBookmark(event.target.checked)}
+              disabled={pageCount === 0 || isBookmarkSaving}
+            />
+            {isZh ? '本页书签' : 'Bookmark page'}
+          </label>
           <div className="explanation-font-controls" aria-label={isZh ? 'AI 字体大小控制' : 'AI font size controls'}>
             <button
               type="button"
@@ -255,7 +305,51 @@ export default function ExplanationPanel({
         </div>
       </div>
 
-      <div className="explanation-body">
+      <div className="explanation-body-wrap">
+        {isCurrentPageBookmarked && (
+          <div ref={bookmarkRef} className="explanation-bookmark-floating">
+            <div className="page-bookmark-wrap page-bookmark-wrap--floating">
+              <button
+                type="button"
+                className={`page-bookmark${isBookmarkEditorOpen ? ' page-bookmark--active' : ''}`}
+                onClick={onToggleBookmarkEditor}
+                aria-expanded={isBookmarkEditorOpen}
+                aria-controls="page-bookmark-panel"
+              >
+                <span>{isZh ? '书签' : 'Bookmark'}</span>
+                {currentPageBookmarkText.trim() && <small>{isZh ? '有备注' : 'Note'}</small>}
+              </button>
+              {isBookmarkEditorOpen && (
+                <div id="page-bookmark-panel" className="page-bookmark-panel" onPointerDown={(event) => event.stopPropagation()}>
+                  <div className="page-bookmark-panel__header">
+                    <strong>{isZh ? `第 ${currentPage} 页书签` : `Bookmark for page ${currentPage}`}</strong>
+                    <button type="button" className="edit-btn" onClick={onCloseBookmarkEditor}>
+                      {isZh ? '收起' : 'Close'}
+                    </button>
+                  </div>
+                  <textarea
+                    className="page-bookmark-textarea"
+                    value={bookmarkDraft}
+                    onChange={(event) => onBookmarkDraftChange(event.target.value)}
+                    placeholder={isZh ? '记录这一页的重点、疑问或稍后回看的原因。' : 'Add a note for why this page matters.'}
+                  />
+                  <div className="page-bookmark-panel__footer">
+                    <span>
+                      {bookmarkDraft.trim()
+                        ? (isZh ? `${bookmarkDraft.trim().length} 个字符` : `${bookmarkDraft.trim().length} characters`)
+                        : (isZh ? '可留空，只保留页码书签。' : 'Leave empty to keep a page-only bookmark.')}
+                    </span>
+                    <button type="button" className="ctrl-btn ctrl-btn--soft" onClick={onSaveBookmarkText} disabled={isBookmarkSaving}>
+                      {isBookmarkSaving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存书签' : 'Save bookmark')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="explanation-body">
         {isLoading ? (
           <div className="explanation-loading">
             <div className="spinner" />
@@ -372,6 +466,7 @@ export default function ExplanationPanel({
             </p>
           </div>
         )}
+        </div>
       </div>
 
       <div className="explanation-footer">

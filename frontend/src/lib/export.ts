@@ -10,6 +10,9 @@ const MIN_CAPTURE_HEIGHT = 920
 const MAX_CAPTURE_HEIGHT = 1180
 const SHEET_WIDTH_MULTIPLIER = 2.08
 const PDF_EXPORT_CHUNK_SIZE = 4
+export const MIN_EXPORT_EXPLANATION_FONT_SIZE = 13
+export const MAX_EXPORT_EXPLANATION_FONT_SIZE = 24
+export const DEFAULT_EXPORT_EXPLANATION_FONT_SIZE = 15
 
 type PageData = {
   pageNum: number
@@ -25,6 +28,7 @@ type ExportSheet = {
   captureHeight: number
   pageWidthPt: number
   pageHeightPt: number
+  layout: Required<ExportLayoutOptions>
 }
 
 type ContinuationSheet = {
@@ -47,6 +51,10 @@ type PendingSheetUpload = {
   }
 }
 
+export type ExportLayoutOptions = {
+  explanationFontSizePx?: number
+}
+
 export type PdfExportProgress = {
   phase: 'render' | 'upload' | 'finalize'
   done: number
@@ -54,6 +62,16 @@ export type PdfExportProgress = {
 }
 
 const MAX_BLOCK_COST = 900
+
+function resolveExportLayoutOptions(layoutOptions?: ExportLayoutOptions): Required<ExportLayoutOptions> {
+  return {
+    explanationFontSizePx: clampNumber(
+      Math.round(layoutOptions?.explanationFontSizePx ?? DEFAULT_EXPORT_EXPLANATION_FONT_SIZE),
+      MIN_EXPORT_EXPLANATION_FONT_SIZE,
+      MAX_EXPORT_EXPLANATION_FONT_SIZE,
+    ),
+  }
+}
 
 export function exportAsJson(
   pdfHash: string,
@@ -83,8 +101,10 @@ export async function exportAsHtml(
   pageCount: number,
   exportScale: number,
   includeAllPages: boolean,
+  layoutOptions?: ExportLayoutOptions,
   onProgress?: (done: number, total: number) => void,
 ) {
+  const layout = resolveExportLayoutOptions(layoutOptions)
   const pages = includeAllPages
     ? allPages(pageCount)
     : sortedParsedPages(explanations)
@@ -94,12 +114,14 @@ export async function exportAsHtml(
     explanations,
     pages,
     exportScale,
+    layout,
     onProgress,
   )
   const html = wrapHtml(
     pdfFileName,
     sheets.map((sheet) => sheet.html).join('\n'),
     false,
+    layout,
   )
   const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
   downloadBlob(blob, `${stripExt(pdfFileName)}_讲解_${dateTag()}.html`)
@@ -112,8 +134,10 @@ export async function exportAsPdf(
   pageCount: number,
   exportScale: number,
   includeAllPages: boolean,
+  layoutOptions?: ExportLayoutOptions,
   onProgress?: (progress: PdfExportProgress) => void,
 ) {
+  const layout = resolveExportLayoutOptions(layoutOptions)
   const pages = includeAllPages
     ? allPages(pageCount)
     : sortedParsedPages(explanations)
@@ -140,7 +164,7 @@ export async function exportAsPdf(
       width: image.width,
       height: image.height,
     }
-    const pageSheets = await buildPageSheets(pageData, exportScale)
+    const pageSheets = await buildPageSheets(pageData, exportScale, layout)
 
     for (const sheet of pageSheets) {
       pendingChunk.push({
@@ -199,6 +223,32 @@ export async function exportAsPdf(
   downloadBlob(blob, filename)
 }
 
+export async function renderPdfExportPreview(
+  pdfDocument: PDFDocumentProxy,
+  pageNum: number,
+  explanation: string,
+  exportScale: number,
+  layoutOptions?: ExportLayoutOptions,
+): Promise<string> {
+  const layout = resolveExportLayoutOptions(layoutOptions)
+  const image = await renderPdfPageToDataUrl(pdfDocument, pageNum, exportScale)
+  const pageData: PageData = {
+    pageNum,
+    dataUrl: image.dataUrl,
+    explanation: explanation.trim(),
+    width: image.width,
+    height: image.height,
+  }
+  const pageSheets = await buildPageSheets(pageData, exportScale, layout)
+  const firstSheet = pageSheets[0]
+
+  if (!firstSheet) {
+    throw new Error('Failed to build export preview.')
+  }
+
+  return renderSheetToDataUrl(firstSheet)
+}
+
 function sortedParsedPages(explanations: Record<number, string>): number[] {
   return Object.keys(explanations)
     .map(Number)
@@ -215,6 +265,7 @@ async function buildSheets(
   explanations: Record<number, string>,
   pages: number[],
   exportScale: number,
+  layout: Required<ExportLayoutOptions>,
   onProgress?: (done: number, total: number) => void,
 ): Promise<ExportSheet[]> {
   const allSheets: ExportSheet[] = []
@@ -232,14 +283,18 @@ async function buildSheets(
       width: image.width,
       height: image.height,
     }
-    allSheets.push(...await buildPageSheets(pageData, exportScale))
+    allSheets.push(...await buildPageSheets(pageData, exportScale, layout))
   }
 
   onProgress?.(pages.length, Math.max(1, pages.length * 2))
   return allSheets
 }
 
-async function buildPageSheets(pageData: PageData, exportScale: number): Promise<ExportSheet[]> {
+async function buildPageSheets(
+  pageData: PageData,
+  exportScale: number,
+  layout: Required<ExportLayoutOptions>,
+): Promise<ExportSheet[]> {
   const explanation = pageData.explanation.trim()
   const metrics = buildSheetMetrics(pageData, exportScale)
 
@@ -247,21 +302,24 @@ async function buildPageSheets(pageData: PageData, exportScale: number): Promise
     return [{
       html: buildFirstSheet(pageData, '', true),
       ...metrics,
+      layout,
     }]
   }
 
-  const chunks = await paginateExplanation(pageData, explanation, metrics)
+  const chunks = await paginateExplanation(pageData, explanation, metrics, layout)
   const sheets: ExportSheet[] = []
 
   sheets.push({
     html: buildFirstSheet(pageData, chunks.firstHtml, false),
     ...metrics,
+    layout,
   })
 
   for (const continuation of chunks.continuations) {
     sheets.push({
       html: buildContinuationSheet(pageData.pageNum, continuation),
       ...metrics,
+      layout,
     })
   }
 
@@ -272,6 +330,7 @@ async function paginateExplanation(
   pageData: PageData,
   explanation: string,
   metrics: SheetMetrics,
+  layout: Required<ExportLayoutOptions>,
 ): Promise<{
   firstHtml: string
   continuations: ContinuationSheet[]
@@ -281,6 +340,7 @@ async function paginateExplanation(
   const firstHost = createMeasurementHost({
     html: buildFirstSheet(pageData, '', false),
     ...metrics,
+    layout,
   })
   await waitForCaptureReady(firstHost)
   const firstTarget = firstHost.querySelector('.text-surface')
@@ -295,6 +355,7 @@ async function paginateExplanation(
     const continuationHost = createMeasurementHost({
       html: buildContinuationSheet(pageData.pageNum, { leftHtml: '', rightHtml: '' }),
       ...metrics,
+      layout,
     })
     await waitForCaptureReady(continuationHost)
     const targets = continuationHost.querySelectorAll('.text-surface')
@@ -580,7 +641,12 @@ function buildContinuationSheet(
   `
 }
 
-function wrapHtml(title: string, body: string, forPrint: boolean): string {
+function wrapHtml(
+  title: string,
+  body: string,
+  forPrint: boolean,
+  layout: Required<ExportLayoutOptions>,
+): string {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -588,7 +654,7 @@ function wrapHtml(title: string, body: string, forPrint: boolean): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)} - BookLearning 讲解</title>
 <style>
-  ${buildExportStyles(forPrint)}
+  ${buildExportStyles(forPrint, layout)}
 </style>
 </head>
 <body>
@@ -597,7 +663,7 @@ function wrapHtml(title: string, body: string, forPrint: boolean): string {
 </html>`
 }
 
-function buildExportStyles(forPrint: boolean): string {
+function buildExportStyles(forPrint: boolean, layout: Required<ExportLayoutOptions>): string {
   const exportModeStyles = forPrint
     ? `
   body {
@@ -630,6 +696,9 @@ function buildExportStyles(forPrint: boolean): string {
 
   return `
   ${katexCssText}
+  :root {
+    --export-explanation-font-size: ${layout.explanationFontSizePx}px;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -741,7 +810,7 @@ function buildExportStyles(forPrint: boolean): string {
     justify-content: center;
     min-height: 100%;
     color: #9a8c7c;
-    font-size: 1rem;
+    font-size: 1em;
     border: 1px dashed #dfd4c6;
     border-radius: 8px;
     background: #fcfaf7;
@@ -750,14 +819,14 @@ function buildExportStyles(forPrint: boolean): string {
   }
 
   .explanation-content {
-    font-size: 0.88rem;
+    font-size: var(--export-explanation-font-size, 15px);
     line-height: 1.72;
     word-break: break-word;
     overflow-wrap: anywhere;
   }
-  .explanation-content h1 { font-size: 1.16rem; margin: 0.8em 0 0.4em; }
-  .explanation-content h2 { font-size: 1.02rem; margin: 0.7em 0 0.3em; }
-  .explanation-content h3 { font-size: 0.94rem; margin: 0.6em 0 0.3em; }
+  .explanation-content h1 { font-size: 1.32em; margin: 0.8em 0 0.4em; }
+  .explanation-content h2 { font-size: 1.16em; margin: 0.7em 0 0.3em; }
+  .explanation-content h3 { font-size: 1.07em; margin: 0.6em 0 0.3em; }
   .explanation-content p { margin: 0.45em 0; }
   .explanation-content ul, .explanation-content ol { padding-left: 1.4em; margin: 0.4em 0; }
   .explanation-content li { margin: 0.2em 0; }
@@ -836,6 +905,7 @@ function buildCaptureStyles(): string {
     color: #333;
     font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
     line-height: 1.6;
+    --export-explanation-font-size: 15px;
   }
   .booklearning-export-capture .export-sheet {
     width: 100%;
@@ -935,7 +1005,7 @@ function buildCaptureStyles(): string {
     justify-content: center;
     min-height: 100%;
     color: #9a8c7c;
-    font-size: 1rem;
+    font-size: 1em;
     border: 1px dashed #dfd4c6;
     border-radius: 8px;
     background: #fcfaf7;
@@ -943,14 +1013,14 @@ function buildCaptureStyles(): string {
     text-align: center;
   }
   .booklearning-export-capture .explanation-content {
-    font-size: 0.88rem;
+    font-size: var(--export-explanation-font-size, 15px);
     line-height: 1.72;
     word-break: break-word;
     overflow-wrap: anywhere;
   }
-  .booklearning-export-capture .explanation-content h1 { font-size: 1.16rem; margin: 0.8em 0 0.4em; }
-  .booklearning-export-capture .explanation-content h2 { font-size: 1.02rem; margin: 0.7em 0 0.3em; }
-  .booklearning-export-capture .explanation-content h3 { font-size: 0.94rem; margin: 0.6em 0 0.3em; }
+  .booklearning-export-capture .explanation-content h1 { font-size: 1.32em; margin: 0.8em 0 0.4em; }
+  .booklearning-export-capture .explanation-content h2 { font-size: 1.16em; margin: 0.7em 0 0.3em; }
+  .booklearning-export-capture .explanation-content h3 { font-size: 1.07em; margin: 0.6em 0 0.3em; }
   .booklearning-export-capture .explanation-content p { margin: 0.45em 0; }
   .booklearning-export-capture .explanation-content ul,
   .booklearning-export-capture .explanation-content ol { padding-left: 1.4em; margin: 0.4em 0; }
@@ -1248,7 +1318,7 @@ function createMeasurementHost(sheet: ExportSheet): HTMLDivElement {
   host.style.pointerEvents = 'none'
   host.style.opacity = '0'
   host.dataset.exportHost = 'true'
-  host.innerHTML = `<div class="booklearning-export-capture" style="--capture-sheet-width:${sheet.captureWidth}px; --capture-sheet-height:${sheet.captureHeight}px;">${sheet.html}</div>`
+  host.innerHTML = `<div class="booklearning-export-capture" style="--capture-sheet-width:${sheet.captureWidth}px; --capture-sheet-height:${sheet.captureHeight}px; --export-explanation-font-size:${sheet.layout.explanationFontSizePx}px;">${sheet.html}</div>`
   ;(host as HTMLDivElement & { __exportStyle?: HTMLStyleElement }).__exportStyle = style
   document.body.appendChild(host)
   return host
@@ -1259,7 +1329,7 @@ function destroyMeasurementHost(host: HTMLDivElement): void {
   ;(host as HTMLDivElement & { __exportStyle?: HTMLStyleElement }).__exportStyle?.remove()
 }
 
-async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
+async function renderSheetToDataUrl(sheet: ExportSheet): Promise<string> {
   const host = createMeasurementHost(sheet)
 
   try {
@@ -1270,7 +1340,7 @@ async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
 
     await waitForCaptureReady(captureNode)
 
-    const dataUrl = await toPng(captureNode, {
+    return await toPng(captureNode, {
       cacheBust: true,
       pixelRatio: 1.6,
       backgroundColor: '#ffffff',
@@ -1279,11 +1349,14 @@ async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
       width: sheet.captureWidth,
       height: sheet.captureHeight,
     })
-
-    return dataUrl.replace(/^data:image\/png;base64,/, '')
   } finally {
     destroyMeasurementHost(host)
   }
+}
+
+async function renderSheetToBase64(sheet: ExportSheet): Promise<string> {
+  const dataUrl = await renderSheetToDataUrl(sheet)
+  return dataUrl.replace(/^data:image\/png;base64,/, '')
 }
 
 async function createPdfExportSession(pdfFileName: string): Promise<string> {

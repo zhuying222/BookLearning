@@ -295,10 +295,16 @@ export default function PdfScreenshotCapture({
       {isZh ? '截图' : 'Shot'}
     </button>
   )
+  const floatingNode = (
+    <>
+      {buttonNode}
+      {toast && <div className="pdf-screenshot-toast">{toast}</div>}
+    </>
+  )
 
   return (
     <>
-      {floatingRootElement ? createPortal(buttonNode, floatingRootElement) : buttonNode}
+      {floatingRootElement ? createPortal(floatingNode, floatingRootElement) : floatingNode}
 
       {isCapturing && (
         <div
@@ -326,8 +332,6 @@ export default function PdfScreenshotCapture({
           )}
         </div>
       )}
-
-      {toast && <div className="pdf-screenshot-toast">{toast}</div>}
     </>
   )
 }

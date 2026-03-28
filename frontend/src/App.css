@@ -1024,6 +1024,7 @@
 }
 
 .single-page-stage {
+  height: 100%;
   min-height: 0;
   overflow: auto;
   padding: 16px;
@@ -1031,6 +1032,12 @@
   background:
     radial-gradient(circle at top, rgba(184, 117, 39, 0.06), transparent 40%),
     linear-gradient(180deg, rgba(245, 239, 231, 0.98), rgba(239, 232, 223, 0.96));
+}
+
+.single-page-stage-shell {
+  position: relative;
+  height: 100%;
+  min-height: 0;
 }
 
 .single-page-card {
@@ -1232,10 +1239,10 @@
 .pdf-screenshot-toast {
   position: absolute;
   left: 50%;
-  bottom: 16px;
+  bottom: 18px;
   transform: translateX(-50%);
   z-index: 6;
-  max-width: min(420px, calc(100% - 32px));
+  max-width: min(460px, calc(100% - 112px));
   padding: 8px 12px;
   border-radius: 999px;
   background: rgba(255, 250, 243, 0.96);
@@ -1244,6 +1251,71 @@
   font-size: 0.8rem;
   line-height: 1.4;
   box-shadow: 0 18px 30px -26px rgba(0, 0, 0, 0.5);
+}
+
+.viewer-edge-hotspot {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 7;
+  width: min(92px, 18%);
+  display: flex;
+  align-items: center;
+  pointer-events: auto;
+}
+
+.viewer-edge-hotspot--left {
+  left: 0;
+  justify-content: flex-start;
+}
+
+.viewer-edge-hotspot--right {
+  right: 0;
+  justify-content: flex-end;
+}
+
+.viewer-nav-btn {
+  appearance: none;
+  margin: 0 14px;
+  width: 42px;
+  height: 72px;
+  border: 1px solid rgba(255, 255, 255, 0.36);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.44);
+  color: rgba(67, 50, 32, 0.86);
+  font: inherit;
+  font-size: 1.8rem;
+  line-height: 1;
+  box-shadow: 0 16px 24px -22px rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: auto;
+  transition: opacity 0.16s ease, transform 0.16s ease, background 0.16s ease;
+}
+
+.viewer-nav-btn--left {
+  transform: translateX(-10px);
+}
+
+.viewer-nav-btn--right {
+  transform: translateX(10px);
+}
+
+.viewer-edge-hotspot--left:hover .viewer-nav-btn--left,
+.viewer-edge-hotspot--right:hover .viewer-nav-btn--right,
+.viewer-nav-btn:focus-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.viewer-nav-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.viewer-nav-btn:disabled {
+  opacity: 0;
+  cursor: not-allowed;
 }
 
 .empty-reader {
@@ -1625,6 +1697,7 @@
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .follow-up-item-index {
@@ -1636,8 +1709,11 @@
 }
 
 .follow-up-item-hint {
+  min-width: 0;
+  max-width: 100%;
   color: var(--muted);
   font-size: 0.74rem;
+  text-align: right;
 }
 
 .follow-up-card-badge {
@@ -1753,6 +1829,8 @@
 .note-card {
   display: grid;
   gap: 10px;
+  min-width: 0;
+  width: 100%;
   padding: 12px 14px;
   border-radius: 14px;
   border: 1px solid rgba(40, 94, 90, 0.12);
@@ -1768,11 +1846,14 @@
 .note-list {
   display: grid;
   gap: 10px;
+  min-width: 0;
 }
 
 .note-item {
   display: grid;
   gap: 8px;
+  min-width: 0;
+  width: 100%;
   padding: 11px 12px;
   border-radius: 12px;
   border: 1px solid rgba(40, 94, 90, 0.12);
@@ -1781,6 +1862,8 @@
 
 .note-item-content {
   margin: 0;
+  min-width: 0;
+  width: 100%;
   color: var(--text-h);
   line-height: 1.72;
   word-break: break-word;
@@ -1801,6 +1884,7 @@
 .note-item-content blockquote,
 .note-item-content table {
   margin: 0.6em 0;
+  max-width: 100%;
 }
 
 .note-item-content ul,
@@ -1813,6 +1897,7 @@
 }
 
 .note-item-content pre {
+  max-width: 100%;
   overflow-x: auto;
   padding: 0.8em 0.95em;
   border-radius: 10px;
@@ -1846,6 +1931,7 @@
 
 .note-item-content .katex-display {
   margin: 0.7em 0;
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0.2em 0;

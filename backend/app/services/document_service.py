@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 MAX_FOLDER_DEPTH = 5
 _INDEX_VERSION = 3
+_SUPPORTED_LEGACY_INDEX_VERSIONS = {2}
 _INVALID_FILE_NAME_CHARS = re.compile(r'[\\/:*?"<>|]+')
 _WINDOWS_RESERVED_NAMES = {
     "con",
@@ -416,6 +417,35 @@ def _recover_library_from_storage() -> LibraryIndex:
     return LibraryIndex(version=_INDEX_VERSION, folders=folders, documents=documents)
 
 
+def _upgrade_library_index(data: dict) -> tuple[LibraryIndex, bool]:
+    raw_version = data.get("version", _INDEX_VERSION)
+    if not isinstance(raw_version, int):
+        raise ValueError("library index version must be an integer")
+
+    index = LibraryIndex(**data)
+    if raw_version == _INDEX_VERSION:
+        return index, False
+
+    if raw_version in _SUPPORTED_LEGACY_INDEX_VERSIONS:
+        logger.info("Upgrading library index from version %s to %s.", raw_version, _INDEX_VERSION)
+        return index.model_copy(update={"version": _INDEX_VERSION}), True
+
+    if raw_version < _INDEX_VERSION:
+        logger.warning(
+            "Unsupported legacy library index version %s. Attempting best-effort upgrade to %s.",
+            raw_version,
+            _INDEX_VERSION,
+        )
+        return index.model_copy(update={"version": _INDEX_VERSION}), True
+
+    logger.warning(
+        "Library index version %s is newer than supported version %s. Continuing with best-effort load.",
+        raw_version,
+        _INDEX_VERSION,
+    )
+    return index, False
+
+
 def _load_library() -> LibraryIndex:
     path = _library_index_path()
     if not path.exists():
@@ -438,9 +468,9 @@ def _load_library() -> LibraryIndex:
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("library index root must be an object")
-        index = LibraryIndex(**data)
-        if index.version != _INDEX_VERSION:
-            logger.warning("Unexpected library index version %s. Continuing with best-effort load.", index.version)
+        index, upgraded = _upgrade_library_index(data)
+        if upgraded:
+            _save_library(index)
         return index
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         backup_path = _index_backup_path(path, "corrupt")

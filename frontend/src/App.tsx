@@ -1581,32 +1581,60 @@ function App() {
                 </span>
               </div>
             </div>
-            <div ref={viewerRef} className="single-page-stage" onWheel={handleViewerWheel}>
-              {pageCount === 0 ? (
-                <div className="empty-reader">
-                  <p>{isZh ? '正在从本地书架载入 PDF...' : 'Loading PDF from your local shelf...'}</p>
-                </div>
-              ) : (
-                <div className="single-page-card">
-                  <canvas ref={canvasRef} className="pdf-canvas" />
-                  <PdfHyperlinkLayer
-                    locale={locale}
-                    pdfHash={pdfHash}
-                    pageNumber={currentPage}
-                    scale={scale}
-                    hyperlinks={currentPageHyperlinks}
-                    onHyperlinkUpsert={upsertHyperlink}
-                    onHyperlinkRemove={removeHyperlink}
-                    onJumpToLinkedTarget={handleJumpToLinkedTarget}
-                  />
-                  <PdfScreenshotCapture
-                    locale={locale}
-                    canvasRef={canvasRef}
-                    floatingRootElement={viewerPaneElement}
-                    disabled={!pdfDocument || pageCount === 0}
-                    onCaptureSuccess={handleScreenshotCaptureSuccess}
-                  />
-                </div>
+            <div className="single-page-stage-shell" onWheel={handleViewerWheel}>
+              <div ref={viewerRef} className="single-page-stage">
+                {pageCount === 0 ? (
+                  <div className="empty-reader">
+                    <p>{isZh ? '正在从本地书架载入 PDF...' : 'Loading PDF from your local shelf...'}</p>
+                  </div>
+                ) : (
+                  <div className="single-page-card">
+                    <canvas ref={canvasRef} className="pdf-canvas" />
+                    <PdfHyperlinkLayer
+                      locale={locale}
+                      pdfHash={pdfHash}
+                      pageNumber={currentPage}
+                      scale={scale}
+                      hyperlinks={currentPageHyperlinks}
+                      onHyperlinkUpsert={upsertHyperlink}
+                      onHyperlinkRemove={removeHyperlink}
+                      onJumpToLinkedTarget={handleJumpToLinkedTarget}
+                    />
+                    <PdfScreenshotCapture
+                      locale={locale}
+                      canvasRef={canvasRef}
+                      floatingRootElement={viewerPaneElement}
+                      disabled={!pdfDocument || pageCount === 0}
+                      onCaptureSuccess={handleScreenshotCaptureSuccess}
+                    />
+                  </div>
+                )}
+              </div>
+              {pageCount > 0 && (
+                <>
+                  <div className="viewer-edge-hotspot viewer-edge-hotspot--left">
+                    <button
+                      type="button"
+                      className="viewer-nav-btn viewer-nav-btn--left"
+                      onClick={() => goToPage(currentPage - 1)}
+                      disabled={!pdfDocument || currentPage <= 1}
+                      aria-label={isZh ? '上一页' : 'Previous page'}
+                    >
+                      ‹
+                    </button>
+                  </div>
+                  <div className="viewer-edge-hotspot viewer-edge-hotspot--right">
+                    <button
+                      type="button"
+                      className="viewer-nav-btn viewer-nav-btn--right"
+                      onClick={() => goToPage(currentPage + 1)}
+                      disabled={!pdfDocument || currentPage >= pageCount}
+                      aria-label={isZh ? '下一页' : 'Next page'}
+                    >
+                      ›
+                    </button>
+                  </div>
+                </>
               )}
             </div>
           </section>

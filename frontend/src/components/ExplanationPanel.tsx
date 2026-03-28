@@ -130,6 +130,10 @@ export default function ExplanationPanel({
     () => renderExplanationMarkdown(explanation || ''),
     [explanation],
   )
+  const renderedNotes = useMemo(
+    () => new Map(notes.map((note) => [note.id, renderExplanationMarkdown(note.content)])),
+    [notes],
+  )
   const panelStyle = useMemo(
     () => ({ '--ai-font-size': `${fontSize}px` } as CSSProperties),
     [fontSize],
@@ -868,7 +872,10 @@ export default function ExplanationPanel({
                               </div>
                             </div>
                           ) : (
-                            <p className="note-item-content">{note.content}</p>
+                            <div
+                              className="note-item-content"
+                              dangerouslySetInnerHTML={{ __html: renderedNotes.get(note.id) ?? '' }}
+                            />
                           )}
                         </article>
                       )

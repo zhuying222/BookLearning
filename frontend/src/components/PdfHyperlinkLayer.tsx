@@ -65,7 +65,7 @@ export default function PdfHyperlinkLayer({
     [hyperlinks, pageNumber],
   )
   const overlayStyle = useMemo(
-    () => ({ '--pdf-link-scale': `${Math.max(0.72, scale / DEFAULT_PDF_SCALE)}` } as CSSProperties),
+    () => ({ '--pdf-link-scale': `${Math.max(0.4, (scale / DEFAULT_PDF_SCALE) * 0.56)}` } as CSSProperties),
     [scale],
   )
 

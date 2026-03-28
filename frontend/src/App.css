@@ -1783,8 +1783,72 @@
   margin: 0;
   color: var(--text-h);
   line-height: 1.72;
-  white-space: pre-wrap;
   word-break: break-word;
+}
+
+.note-item-content > :first-child {
+  margin-top: 0;
+}
+
+.note-item-content > :last-child {
+  margin-bottom: 0;
+}
+
+.note-item-content p,
+.note-item-content ul,
+.note-item-content ol,
+.note-item-content pre,
+.note-item-content blockquote,
+.note-item-content table {
+  margin: 0.6em 0;
+}
+
+.note-item-content ul,
+.note-item-content ol {
+  padding-left: 1.4em;
+}
+
+.note-item-content li + li {
+  margin-top: 0.28em;
+}
+
+.note-item-content pre {
+  overflow-x: auto;
+  padding: 0.8em 0.95em;
+  border-radius: 10px;
+  background: rgba(26, 38, 37, 0.06);
+}
+
+.note-item-content code {
+  font-family: var(--mono);
+  font-size: 0.95em;
+}
+
+.note-item-content th,
+.note-item-content td {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.note-item-content th {
+  background: rgba(40, 94, 90, 0.08);
+  font-weight: 600;
+}
+
+.note-item-content strong {
+  color: var(--text-h);
+}
+
+.note-item-content .katex {
+  font-size: 1.02em;
+}
+
+.note-item-content .katex-display {
+  margin: 0.7em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
 }
 
 .note-compose-surface {
@@ -1958,14 +2022,14 @@
   appearance: none;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  max-width: min(240px, 48%);
-  padding: 6px 10px;
+  gap: 4px;
+  max-width: min(164px, 36%);
+  padding: 4px 7px;
   border: 1px solid rgba(178, 110, 24, 0.28);
   border-radius: 999px;
   background: rgba(255, 248, 236, 0.96);
   color: var(--accent-strong);
-  box-shadow: 0 12px 24px -20px rgba(89, 59, 17, 0.8);
+  box-shadow: 0 10px 18px -18px rgba(89, 59, 17, 0.72);
   pointer-events: auto;
   cursor: grab;
 }
@@ -1977,11 +2041,11 @@
 .page-link-marker__icon {
   display: inline-grid;
   place-items: center;
-  width: 18px;
-  height: 18px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: rgba(178, 110, 24, 0.14);
-  font-size: 0.72rem;
+  font-size: 0.54rem;
   font-weight: 700;
   flex-shrink: 0;
 }
@@ -1991,7 +2055,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.8rem;
+  font-size: 0.62rem;
   font-weight: 600;
 }
 

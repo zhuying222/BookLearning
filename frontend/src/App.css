@@ -1255,37 +1255,39 @@
 
 .viewer-edge-hotspot {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: 50%;
+  transform: translateY(-50%);
   z-index: 7;
-  width: min(92px, 18%);
-  display: flex;
-  align-items: center;
+  width: 76px;
+  height: 76px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
   pointer-events: auto;
 }
 
 .viewer-edge-hotspot--left {
-  left: 0;
-  justify-content: flex-start;
+  left: 10px;
 }
 
 .viewer-edge-hotspot--right {
-  right: 0;
-  justify-content: flex-end;
+  right: 10px;
 }
 
 .viewer-nav-btn {
   appearance: none;
-  margin: 0 14px;
-  width: 42px;
-  height: 72px;
+  width: 48px;
+  height: 48px;
+  padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.36);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.44);
   color: rgba(67, 50, 32, 0.86);
   font: inherit;
-  font-size: 1.8rem;
+  font-size: 1.5rem;
   line-height: 1;
+  display: grid;
+  place-items: center;
   box-shadow: 0 16px 24px -22px rgba(0, 0, 0, 0.65);
   backdrop-filter: blur(10px);
   cursor: pointer;
@@ -1295,18 +1297,18 @@
 }
 
 .viewer-nav-btn--left {
-  transform: translateX(-10px);
+  transform: translateX(-6px) scale(0.92);
 }
 
 .viewer-nav-btn--right {
-  transform: translateX(10px);
+  transform: translateX(6px) scale(0.92);
 }
 
-.viewer-edge-hotspot--left:hover .viewer-nav-btn--left,
-.viewer-edge-hotspot--right:hover .viewer-nav-btn--right,
+.viewer-edge-hotspot--left:hover .viewer-nav-btn--left:not(:disabled),
+.viewer-edge-hotspot--right:hover .viewer-nav-btn--right:not(:disabled),
 .viewer-nav-btn:focus-visible {
   opacity: 1;
-  transform: translateX(0);
+  transform: translateX(0) scale(1);
 }
 
 .viewer-nav-btn:hover:not(:disabled) {

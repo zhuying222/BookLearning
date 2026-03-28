@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ParseCostInfo(BaseModel):
@@ -14,6 +14,7 @@ class ParsePageRequest(BaseModel):
     pdf_hash: str
     page_number: int
     image_base64: str
+    extra_images_base64: list[str] = Field(default_factory=list)
     config_id: str | None = None
     page_prompt: str | None = None
     force: bool = False
@@ -49,6 +50,7 @@ class FollowUpRequest(BaseModel):
     pdf_hash: str
     page_number: int
     image_base64: str
+    extra_images_base64: list[str] = Field(default_factory=list)
     question: str
     current_explanation: str
     config_id: str | None = None

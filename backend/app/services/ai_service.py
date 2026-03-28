@@ -25,6 +25,7 @@ class CostInfo:
 async def call_vision_model(
     config: AiConfig,
     image_base64: str,
+    extra_images_base64: list[str] | None = None,
     page_prompt: str | None = None,
     context_summary: str | None = None,
     extra_system_prompt: str | None = None,
@@ -39,18 +40,39 @@ async def call_vision_model(
         system_prompt += f"\n\n{extra_system_prompt}"
 
     user_text = user_text_override or page_prompt or prompt_config.user_prompt_template
+    user_content = [
+        {"type": "text", "text": user_text},
+        {
+            "type": "text",
+            "text": "第1张图片是当前 PDF 整页截图。请优先基于整页判断上下文。",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+        },
+    ]
+
+    if extra_images_base64:
+        user_content.append(
+            {
+                "type": "text",
+                "text": f"后面还有 {len(extra_images_base64)} 张局部截图，请把它们当作用户重点关注的细节补充。",
+            }
+        )
+        for index, extra_image_base64 in enumerate(extra_images_base64, start=1):
+            user_content.extend([
+                {"type": "text", "text": f"补充截图 {index}"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{extra_image_base64}"},
+                },
+            ])
 
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_base64}"},
-                },
-            ],
+            "content": user_content,
         },
     ]
 

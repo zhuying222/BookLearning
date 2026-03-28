@@ -8,8 +8,10 @@ import Bookshelf from './components/Bookshelf'
 import ExplanationPanel from './components/ExplanationPanel'
 import ParseNotificationCenter, { type ParseNotification, type ParseNotificationKind } from './components/ParseNotificationCenter'
 import ParseControls from './components/ParseControls'
+import PdfHyperlinkLayer from './components/PdfHyperlinkLayer'
+import PdfScreenshotCapture from './components/PdfScreenshotCapture'
 import PromptEditor from './components/PromptEditor'
-import type { FollowUpRecord, LibraryDocument, LibraryFolder, TaskStatus } from './lib/api'
+import type { FollowUpRecord, HyperlinkRecord, LibraryDocument, LibraryFolder, NoteRecord, TaskStatus } from './lib/api'
 import {
   createFolder,
   deleteDocumentBookmark,
@@ -21,7 +23,9 @@ import {
   importDocument,
   listLibrary,
   loadAllCachedExplanations,
+  loadSavedHyperlinks,
   loadSavedFollowUps,
+  loadSavedNotes,
   moveDocument,
   moveFolder,
   parseRange,
@@ -41,6 +45,7 @@ import {
   renderPdfExportPreview,
 } from './lib/export'
 import type { PdfExportProgress } from './lib/export'
+import { blobToDataUrl, writeImageDataUrlToClipboard } from './lib/clipboard'
 import { clamp, formatPageSelection, parsePageSelection } from './lib/pageSelection'
 import {
   loadPdfDocument,
@@ -61,6 +66,17 @@ const PARSE_NOTIFICATION_DURATION_MS = 10000
 type Locale = 'zh' | 'en'
 type ViewMode = 'library' | 'reader'
 type OverwriteDialogState = { page: number } | null
+type PanelMode = 'explanation' | 'follow-up' | 'note'
+type JumpTarget = {
+  pageNumber: number
+  targetType: 'followup' | 'note'
+  targetId: string
+} | null
+type PromptAttachment = {
+  id: string
+  label: string
+  dataUrl: string
+}
 
 type StatusState =
   | { key: 'idle' }
@@ -94,6 +110,40 @@ function resolveTaskResultPages(results: Record<number, string>): number[] {
     .map(Number)
     .filter((pageNumber) => Number.isFinite(pageNumber))
     .sort((left, right) => left - right)
+}
+
+function sortHyperlinks(items: HyperlinkRecord[]): HyperlinkRecord[] {
+  return [...items].sort((left, right) => {
+    if (left.page_number !== right.page_number) {
+      return left.page_number - right.page_number
+    }
+    return left.created_at.localeCompare(right.created_at)
+  })
+}
+
+function updateAttachmentMap(
+  source: Record<number, PromptAttachment[]>,
+  pageNumber: number,
+  items: PromptAttachment[],
+): Record<number, PromptAttachment[]> {
+  if (items.length === 0) {
+    if (!(pageNumber in source)) {
+      return source
+    }
+
+    const next = { ...source }
+    delete next[pageNumber]
+    return next
+  }
+
+  return {
+    ...source,
+    [pageNumber]: items,
+  }
+}
+
+function toBase64ImagePayload(dataUrl: string): string {
+  return dataUrl.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '')
 }
 
 function getStatusText(locale: Locale, status: StatusState): string {
@@ -163,8 +213,13 @@ function App() {
   const [batchPreparationStatus, setBatchPreparationStatus] = useState('')
   const [pagePrompts, setPagePrompts] = useState<Record<number, string>>({})
   const [followUps, setFollowUps] = useState<Record<number, FollowUpRecord[]>>({})
+  const [notes, setNotes] = useState<Record<number, NoteRecord[]>>({})
   const [followUpDrafts, setFollowUpDrafts] = useState<Record<number, string>>({})
-  const [followUpModePage, setFollowUpModePage] = useState<number | null>(null)
+  const [pagePromptAttachments, setPagePromptAttachments] = useState<Record<number, PromptAttachment[]>>({})
+  const [followUpAttachments, setFollowUpAttachments] = useState<Record<number, PromptAttachment[]>>({})
+  const [panelModePage, setPanelModePage] = useState<{ page: number; mode: 'follow-up' | 'note' } | null>(null)
+  const [hyperlinks, setHyperlinks] = useState<HyperlinkRecord[]>([])
+  const [jumpTarget, setJumpTarget] = useState<JumpTarget>(null)
   const [parseNotifications, setParseNotifications] = useState<ParseNotification[]>([])
   const [skipOverwritePrompt, setSkipOverwritePrompt] = useState(false)
   const [overwriteDialog, setOverwriteDialog] = useState<OverwriteDialogState>(null)
@@ -177,6 +232,7 @@ function App() {
   const [pdfExportPreviewImage, setPdfExportPreviewImage] = useState('')
   const [pdfExportPreviewError, setPdfExportPreviewError] = useState('')
   const [isPdfExportPreviewLoading, setIsPdfExportPreviewLoading] = useState(false)
+  const [viewerPaneElement, setViewerPaneElement] = useState<HTMLElement | null>(null)
 
   const activeDocumentRef = useRef<PDFDocumentProxy | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -187,7 +243,9 @@ function App() {
   const documentLoadSeqRef = useRef(0)
   const pdfExportPreviewSeqRef = useRef(0)
   const parseNotificationSeqRef = useRef(0)
+  const attachmentSeqRef = useRef(0)
   const completedTaskToastIdsRef = useRef(new Set<string>())
+  const pendingFollowUpNoticeRef = useRef<{ page: number; followUpId: string } | null>(null)
 
   const isZh = locale === 'zh'
   const statusText = useMemo(() => getStatusText(locale, status), [locale, status])
@@ -200,11 +258,20 @@ function App() {
     () => parsePageSelection(batchRangeInput, pageCount),
     [batchRangeInput, pageCount],
   )
+  const currentPanelMode: PanelMode = panelModePage?.page === currentPage ? panelModePage.mode : 'explanation'
   const isCurrentPageInBatch = selectedBatchPages.includes(currentPage)
   const currentPagePrompt = pagePrompts[currentPage] ?? ''
   const currentPageFollowUps = followUps[currentPage] ?? []
+  const currentPageNotes = notes[currentPage] ?? []
   const currentFollowUpDraft = followUpDrafts[currentPage] ?? ''
-  const isCurrentPageFollowUpMode = followUpModePage === currentPage
+  const isCurrentPageFollowUpMode = currentPanelMode === 'follow-up'
+  const isCurrentPageNoteMode = currentPanelMode === 'note'
+  const currentPromptAttachments = useMemo(
+    () => (isCurrentPageFollowUpMode
+      ? (followUpAttachments[currentPage] ?? [])
+      : (pagePromptAttachments[currentPage] ?? [])),
+    [currentPage, followUpAttachments, isCurrentPageFollowUpMode, pagePromptAttachments],
+  )
   const currentPageExplanation = explanations[currentPage]?.trim() ?? ''
   const activeTaskId = activeTask?.task_id ?? null
   const activeTaskStatus = activeTask?.status ?? null
@@ -221,6 +288,10 @@ function App() {
     [pagePrompts],
   )
   const isCurrentPageParsing = parsingPages.includes(currentPage)
+  const currentPageHyperlinks = useMemo(
+    () => hyperlinks.filter((item) => item.page_number === currentPage),
+    [currentPage, hyperlinks],
+  )
 
   const syncDocumentIntoShelf = useCallback((document: LibraryDocument) => {
     setCurrentDocumentMeta(document)
@@ -248,6 +319,49 @@ function App() {
     })
   }, [])
 
+  const applyNotesToPage = useCallback((pageNumber: number, items: NoteRecord[]) => {
+    setNotes((prev) => {
+      if (items.length === 0) {
+        if (!(pageNumber in prev)) {
+          return prev
+        }
+        const next = { ...prev }
+        delete next[pageNumber]
+        return next
+      }
+
+      return {
+        ...prev,
+        [pageNumber]: items,
+      }
+    })
+  }, [])
+
+  const upsertHyperlink = useCallback((item: HyperlinkRecord) => {
+    setHyperlinks((prev) => {
+      const existingIndex = prev.findIndex((link) => link.id === item.id)
+      if (existingIndex === -1) {
+        return sortHyperlinks([...prev, item])
+      }
+
+      const next = [...prev]
+      next[existingIndex] = item
+      return sortHyperlinks(next)
+    })
+  }, [])
+
+  const removeHyperlink = useCallback((hyperlinkId: string) => {
+    setHyperlinks((prev) => prev.filter((item) => item.id !== hyperlinkId))
+  }, [])
+
+  const pruneHyperlinksForTarget = useCallback((pageNumber: number, targetType: 'followup' | 'note', targetId: string) => {
+    setHyperlinks((prev) => prev.filter((item) => !(
+      item.page_number === pageNumber
+      && item.target_type === targetType
+      && item.target_id === targetId
+    )))
+  }, [])
+
   const clearParseNotifications = useCallback(() => {
     setParseNotifications([])
   }, [])
@@ -262,6 +376,9 @@ function App() {
     targetPage: number | null,
   ) => {
     if (pages.length === 0) return
+    if (kind !== 'batch' && targetPage !== null && viewMode === 'reader' && targetPage === currentPage) {
+      return
+    }
 
     parseNotificationSeqRef.current += 1
     setParseNotifications((prev) => [
@@ -274,7 +391,107 @@ function App() {
         durationMs: PARSE_NOTIFICATION_DURATION_MS,
       },
     ])
+  }, [currentPage, viewMode])
+
+  useEffect(() => {
+    const pending = pendingFollowUpNoticeRef.current
+    if (!pending) {
+      return
+    }
+
+    const pageItems = followUps[pending.page] ?? []
+    if (!pageItems.some((item) => item.id === pending.followUpId)) {
+      return
+    }
+
+    pendingFollowUpNoticeRef.current = null
+    enqueueParseNotification('follow-up', [pending.page], pending.page)
+  }, [enqueueParseNotification, followUps])
+
+  const clearAllPromptAttachments = useCallback(() => {
+    attachmentSeqRef.current = 0
+    setPagePromptAttachments({})
+    setFollowUpAttachments({})
   }, [])
+
+  const clearCurrentPromptAttachments = useCallback(() => {
+    if (isCurrentPageFollowUpMode) {
+      setFollowUpAttachments((prev) => updateAttachmentMap(prev, currentPage, []))
+      return
+    }
+
+    setPagePromptAttachments((prev) => updateAttachmentMap(prev, currentPage, []))
+  }, [currentPage, isCurrentPageFollowUpMode])
+
+  const handlePromptImagePaste = useCallback(async (files: File[]) => {
+    if (files.length === 0 || isCurrentPageNoteMode) {
+      return
+    }
+
+    try {
+      const nextAttachments = await Promise.all(files.map(async (file) => {
+        attachmentSeqRef.current += 1
+        const order = attachmentSeqRef.current
+        return {
+          id: `shot-${currentPage}-${order}-${Date.now()}`,
+          label: isZh ? `截图${order}` : `Shot ${order}`,
+          dataUrl: await blobToDataUrl(file),
+        } satisfies PromptAttachment
+      }))
+
+      if (isCurrentPageFollowUpMode) {
+        setFollowUpAttachments((prev) => updateAttachmentMap(
+          prev,
+          currentPage,
+          [...(prev[currentPage] ?? []), ...nextAttachments],
+        ))
+        return
+      }
+
+      setPagePromptAttachments((prev) => updateAttachmentMap(
+        prev,
+        currentPage,
+        [...(prev[currentPage] ?? []), ...nextAttachments],
+      ))
+    } catch (error) {
+      setParseError(error instanceof Error ? error.message : (isZh ? '粘贴截图失败。' : 'Failed to paste screenshot.'))
+    }
+  }, [currentPage, isCurrentPageFollowUpMode, isCurrentPageNoteMode, isZh])
+
+  const handleRemoveCurrentPromptAttachment = useCallback((attachmentId: string) => {
+    if (isCurrentPageFollowUpMode) {
+      setFollowUpAttachments((prev) => updateAttachmentMap(
+        prev,
+        currentPage,
+        (prev[currentPage] ?? []).filter((attachment) => attachment.id !== attachmentId),
+      ))
+      return
+    }
+
+    setPagePromptAttachments((prev) => updateAttachmentMap(
+      prev,
+      currentPage,
+      (prev[currentPage] ?? []).filter((attachment) => attachment.id !== attachmentId),
+    ))
+  }, [currentPage, isCurrentPageFollowUpMode])
+
+  const handleCopyCurrentPromptAttachment = useCallback(async (attachmentId: string) => {
+    const source = isCurrentPageFollowUpMode ? followUpAttachments : pagePromptAttachments
+    const attachment = (source[currentPage] ?? []).find((item) => item.id === attachmentId)
+    if (!attachment) {
+      return
+    }
+
+    try {
+      await writeImageDataUrlToClipboard(attachment.dataUrl)
+    } catch (error) {
+      setParseError(error instanceof Error ? error.message : (isZh ? '复制截图失败。' : 'Failed to copy screenshot.'))
+    }
+  }, [currentPage, followUpAttachments, isCurrentPageFollowUpMode, isZh, pagePromptAttachments])
+
+  const handleScreenshotCaptureSuccess = useCallback(() => {
+    clearAllPromptAttachments()
+  }, [clearAllPromptAttachments])
 
   const resetReaderState = useCallback(() => {
     if (activeDocumentRef.current) {
@@ -292,8 +509,14 @@ function App() {
     setParsingPages([])
     setPagePrompts({})
     setFollowUps({})
+    setNotes({})
     setFollowUpDrafts({})
-    setFollowUpModePage(null)
+    setPagePromptAttachments({})
+    setFollowUpAttachments({})
+    setPanelModePage(null)
+    setHyperlinks([])
+    setJumpTarget(null)
+    pendingFollowUpNoticeRef.current = null
     clearParseNotifications()
     setOverwriteDialog(null)
     setSkipOverwritePromptChecked(false)
@@ -306,6 +529,7 @@ function App() {
     setBookmarkError('')
     setBookmarkDraft('')
     setBookmarkEditorPage(null)
+    attachmentSeqRef.current = 0
   }, [clearParseNotifications])
 
   const refreshLibraryDocuments = useCallback(async (silent = false) => {
@@ -536,8 +760,12 @@ function App() {
     setParsingPages([])
     setPagePrompts({})
     setFollowUps({})
+    setNotes({})
     setFollowUpDrafts({})
-    setFollowUpModePage(null)
+    setPanelModePage(null)
+    setHyperlinks([])
+    setJumpTarget(null)
+    pendingFollowUpNoticeRef.current = null
     clearParseNotifications()
     setOverwriteDialog(null)
     setSkipOverwritePromptChecked(false)
@@ -587,9 +815,8 @@ function App() {
       syncDocumentIntoShelf(openedDocument)
 
       const cached = await loadAllCachedExplanations(document.pdf_hash).catch(() => null)
-      if (requestSeq !== documentLoadSeqRef.current || !cached) return
-
-      if (cached.pages && Object.keys(cached.pages).length > 0) {
+      if (requestSeq !== documentLoadSeqRef.current) return
+      if (cached?.pages && Object.keys(cached.pages).length > 0) {
         const mapped: Record<number, string> = {}
         for (const [k, v] of Object.entries(cached.pages)) {
           mapped[Number(k)] = v
@@ -598,14 +825,29 @@ function App() {
       }
 
       const savedFollowUps = await loadSavedFollowUps(document.pdf_hash).catch(() => null)
-      if (requestSeq !== documentLoadSeqRef.current || !savedFollowUps) return
-
-      if (savedFollowUps.pages && Object.keys(savedFollowUps.pages).length > 0) {
+      if (requestSeq !== documentLoadSeqRef.current) return
+      if (savedFollowUps?.pages && Object.keys(savedFollowUps.pages).length > 0) {
         const mapped: Record<number, FollowUpRecord[]> = {}
         for (const [k, v] of Object.entries(savedFollowUps.pages)) {
           mapped[Number(k)] = v
         }
         setFollowUps(mapped)
+      }
+
+      const savedNotes = await loadSavedNotes(document.pdf_hash).catch(() => null)
+      if (requestSeq !== documentLoadSeqRef.current) return
+      if (savedNotes?.pages && Object.keys(savedNotes.pages).length > 0) {
+        const mapped: Record<number, NoteRecord[]> = {}
+        for (const [k, v] of Object.entries(savedNotes.pages)) {
+          mapped[Number(k)] = v
+        }
+        setNotes(mapped)
+      }
+
+      const savedHyperlinks = await loadSavedHyperlinks(document.pdf_hash).catch(() => null)
+      if (requestSeq !== documentLoadSeqRef.current) return
+      if (savedHyperlinks?.hyperlinks) {
+        setHyperlinks(sortHyperlinks(savedHyperlinks.hyperlinks))
       }
     } catch (error) {
       if (requestSeq !== documentLoadSeqRef.current) return
@@ -820,6 +1062,22 @@ function App() {
     }
   }, [dismissParseNotification, goToPage])
 
+  const handleJumpToLinkedTarget = useCallback((pageNumber: number, targetType: 'followup' | 'note', targetId: string) => {
+    setJumpTarget({ pageNumber, targetType, targetId })
+    if (pageNumber !== currentPage) {
+      goToPage(pageNumber)
+    }
+  }, [currentPage, goToPage])
+
+  const handleJumpTargetHandled = useCallback(() => {
+    setJumpTarget((prev) => {
+      if (!prev || prev.pageNumber !== currentPage) {
+        return prev
+      }
+      return null
+    })
+  }, [currentPage])
+
   const handleJumpSubmit = () => {
     const targetPage = Number.parseInt(jumpInput, 10)
     if (Number.isFinite(targetPage)) goToPage(targetPage)
@@ -894,35 +1152,39 @@ function App() {
     try {
       const image = await renderPdfPageToDataUrl(pdfDocument, pageToParse, DEFAULT_EXPORT_SCALE)
       const base64 = image.dataUrl.replace(/^data:image\/png;base64,/, '')
+      const extraImagesBase64 = currentPromptAttachments.map((attachment) => toBase64ImagePayload(attachment.dataUrl))
       if (isCurrentPageFollowUpMode) {
         const question = currentFollowUpDraft.trim()
         if (!question) {
           throw new Error(isZh ? '请输入追问内容后再发送。' : 'Enter a follow-up question before sending.')
-        }
-        if (!currentPageExplanation) {
-          throw new Error(isZh ? '当前页还没有主讲解，暂时不能追问。' : 'A main explanation is required before follow-up.')
         }
 
         const result = await followUpPage({
           pdf_hash: pdfHash,
           page_number: pageToParse,
           image_base64: base64,
+          extra_images_base64: extraImagesBase64.length > 0 ? extraImagesBase64 : undefined,
           question,
           current_explanation: currentPageExplanation,
         })
+        pendingFollowUpNoticeRef.current = {
+          page: pageToParse,
+          followUpId: result.follow_up.id,
+        }
         applyFollowUpsToPage(pageToParse, [...(followUps[pageToParse] ?? []), result.follow_up])
-        enqueueParseNotification('follow-up', [pageToParse], pageToParse)
       } else {
         const result = await parseSinglePage({
           pdf_hash: pdfHash,
           page_number: pageToParse,
           image_base64: base64,
+          extra_images_base64: extraImagesBase64.length > 0 ? extraImagesBase64 : undefined,
           page_prompt: currentPagePrompt.trim() || undefined,
           force: forceExplanationOverwrite,
         })
         setExplanations((prev) => ({ ...prev, [pageToParse]: result.explanation }))
         enqueueParseNotification('page', [pageToParse], pageToParse)
       }
+      clearCurrentPromptAttachments()
       setStatus({ key: 'parsed', page: pageToParse })
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Parse failed'
@@ -937,6 +1199,8 @@ function App() {
     currentPage,
     currentPageExplanation,
     currentPagePrompt,
+    currentPromptAttachments,
+    clearCurrentPromptAttachments,
     enqueueParseNotification,
     followUps,
     isCurrentPageFollowUpMode,
@@ -981,10 +1245,22 @@ function App() {
   }, [currentPage, overwriteDialog?.page, runCurrentPageAction, skipOverwritePromptChecked])
 
   const handleToggleFollowUpMode = useCallback(() => {
-    if (!currentPageExplanation) return
-    setFollowUpModePage((prev) => (prev === currentPage ? null : currentPage))
+    setPanelModePage((prev) => (
+      prev?.page === currentPage && prev.mode === 'follow-up'
+        ? null
+        : { page: currentPage, mode: 'follow-up' }
+    ))
     setParseError('')
-  }, [currentPage, currentPageExplanation])
+  }, [currentPage])
+
+  const handleToggleNoteMode = useCallback(() => {
+    setPanelModePage((prev) => (
+      prev?.page === currentPage && prev.mode === 'note'
+        ? null
+        : { page: currentPage, mode: 'note' }
+    ))
+    setParseError('')
+  }, [currentPage])
 
   const handleParseRange = useCallback(async (rangeStr: string, force: boolean) => {
     if (!pdfDocument || !pdfHash) return
@@ -1119,7 +1395,7 @@ function App() {
   const isPdfExportPreviewOpen = pdfExportPreviewPage !== null
   const isPrimaryActionDisabled = !pdfDocument
     || isCurrentPageParsing
-    || (isCurrentPageFollowUpMode && (!currentPageExplanation || !currentFollowUpDraft.trim()))
+    || (isCurrentPageFollowUpMode && !currentFollowUpDraft.trim())
 
   const handleExportJson = useCallback(() => {
     if (!pdfHash) return
@@ -1294,7 +1570,7 @@ function App() {
           className={`main-layout${isResizing ? ' main-layout--resizing' : ''}`}
           style={{ gridTemplateColumns: `${viewerRatio}fr 8px ${100 - viewerRatio}fr` }}
         >
-          <section className="viewer-pane">
+          <section ref={setViewerPaneElement} className="viewer-pane">
             <div className="viewer-toolbar">
               <span className="viewer-toolbar__title">{displayFileName}</span>
               <div className="viewer-toolbar__actions">
@@ -1313,6 +1589,23 @@ function App() {
               ) : (
                 <div className="single-page-card">
                   <canvas ref={canvasRef} className="pdf-canvas" />
+                  <PdfHyperlinkLayer
+                    locale={locale}
+                    pdfHash={pdfHash}
+                    pageNumber={currentPage}
+                    scale={scale}
+                    hyperlinks={currentPageHyperlinks}
+                    onHyperlinkUpsert={upsertHyperlink}
+                    onHyperlinkRemove={removeHyperlink}
+                    onJumpToLinkedTarget={handleJumpToLinkedTarget}
+                  />
+                  <PdfScreenshotCapture
+                    locale={locale}
+                    canvasRef={canvasRef}
+                    floatingRootElement={viewerPaneElement}
+                    disabled={!pdfDocument || pageCount === 0}
+                    onCaptureSuccess={handleScreenshotCaptureSuccess}
+                  />
                 </div>
               )}
             </div>
@@ -1341,10 +1634,13 @@ function App() {
                 currentPage={currentPage}
                 explanations={explanations}
                 followUps={currentPageFollowUps}
-                isFollowUpMode={isCurrentPageFollowUpMode}
+                notes={currentPageNotes}
+                hyperlinks={hyperlinks}
+                activeMode={currentPanelMode}
                 isLoading={isCurrentPageParsing}
                 pageCount={pageCount}
                 pdfHash={pdfHash}
+                jumpTarget={jumpTarget}
                 isCurrentPageBookmarked={isCurrentPageBookmarked}
                 currentPageBookmarkText={currentPageBookmarkText}
                 bookmarkDraft={bookmarkDraft}
@@ -1354,7 +1650,13 @@ function App() {
                   setExplanations((prev) => ({ ...prev, [page]: text }))
                 }}
                 onFollowUpsUpdate={applyFollowUpsToPage}
+                onNotesUpdate={applyNotesToPage}
+                onHyperlinkUpsert={upsertHyperlink}
+                onPruneHyperlinksForTarget={pruneHyperlinksForTarget}
+                onJumpToLinkedTarget={handleJumpToLinkedTarget}
+                onJumpTargetHandled={handleJumpTargetHandled}
                 onToggleFollowUpMode={handleToggleFollowUpMode}
+                onToggleNoteMode={handleToggleNoteMode}
                 onBookmarkDraftChange={setBookmarkDraft}
                 onToggleBookmark={(checked) => { void handleToggleBookmark(checked) }}
                 onToggleBookmarkEditor={handleToggleBookmarkEditor}
@@ -1440,7 +1742,12 @@ function App() {
                   configuredPromptCount={configuredPromptCount}
                   onTaskUpdate={setActiveTask}
                   batchPreparationStatus={batchPreparationStatus}
-                  isFollowUpMode={isCurrentPageFollowUpMode}
+                  attachments={currentPromptAttachments.map(({ id, label }) => ({ id, label }))}
+                  allowAttachments={!isCurrentPageNoteMode}
+                  onPromptImagePaste={handlePromptImagePaste}
+                  onAttachmentRemove={handleRemoveCurrentPromptAttachment}
+                  onAttachmentCopy={handleCopyCurrentPromptAttachment}
+                  mode={isCurrentPageFollowUpMode ? 'follow-up' : 'explanation'}
                 />
 
                 <section className="control-card">

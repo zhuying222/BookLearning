@@ -1,23 +1,43 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
+import type {
+  CSSProperties,
+  MouseEvent as ReactMouseEvent,
+} from 'react'
 import 'katex/dist/katex.min.css'
-import type { FollowUpRecord } from '../lib/api'
-import { deleteFollowUp, saveEditedExplanation, updateFollowUp } from '../lib/api'
+import type { FollowUpRecord, HyperlinkRecord, NoteRecord } from '../lib/api'
+import {
+  createHyperlink,
+  createNote,
+  deleteFollowUp,
+  deleteNote,
+  saveEditedExplanation,
+  updateFollowUp,
+  updateNote,
+} from '../lib/api'
 import { renderExplanationMarkdown } from '../lib/renderMarkdown'
 
 const MIN_AI_FONT_SIZE = 13
 const MAX_AI_FONT_SIZE = 24
 const DEFAULT_AI_FONT_SIZE = 15
 
+type JumpTarget = {
+  pageNumber: number
+  targetType: 'followup' | 'note'
+  targetId: string
+} | null
+
 type Props = {
   locale: 'zh' | 'en'
   currentPage: number
   explanations: Record<number, string>
   followUps: FollowUpRecord[]
-  isFollowUpMode: boolean
+  notes: NoteRecord[]
+  hyperlinks: HyperlinkRecord[]
+  activeMode: 'explanation' | 'follow-up' | 'note'
   isLoading: boolean
   pageCount: number
   pdfHash: string
+  jumpTarget: JumpTarget
   isCurrentPageBookmarked: boolean
   currentPageBookmarkText: string
   bookmarkDraft: string
@@ -25,7 +45,13 @@ type Props = {
   isBookmarkSaving: boolean
   onExplanationUpdate: (page: number, text: string) => void
   onFollowUpsUpdate: (page: number, items: FollowUpRecord[]) => void
+  onNotesUpdate: (page: number, items: NoteRecord[]) => void
+  onHyperlinkUpsert: (item: HyperlinkRecord) => void
+  onPruneHyperlinksForTarget: (pageNumber: number, targetType: 'followup' | 'note', targetId: string) => void
+  onJumpToLinkedTarget: (pageNumber: number, targetType: 'followup' | 'note', targetId: string) => void
+  onJumpTargetHandled: () => void
   onToggleFollowUpMode: () => void
+  onToggleNoteMode: () => void
   onBookmarkDraftChange: (value: string) => void
   onToggleBookmark: (checked: boolean) => void
   onToggleBookmarkEditor: () => void
@@ -33,8 +59,11 @@ type Props = {
   onSaveBookmarkText: () => void
 }
 
-type FollowUpMenuState = {
-  followUpId: string
+type ContextMenuKind = 'followup' | 'note'
+
+type ContextMenuState = {
+  kind: ContextMenuKind
+  id: string
   x: number
   y: number
 } | null
@@ -44,10 +73,13 @@ export default function ExplanationPanel({
   currentPage,
   explanations,
   followUps,
-  isFollowUpMode,
+  notes,
+  hyperlinks,
+  activeMode,
   isLoading,
   pageCount,
   pdfHash,
+  jumpTarget,
   isCurrentPageBookmarked,
   currentPageBookmarkText,
   bookmarkDraft,
@@ -55,7 +87,13 @@ export default function ExplanationPanel({
   isBookmarkSaving,
   onExplanationUpdate,
   onFollowUpsUpdate,
+  onNotesUpdate,
+  onHyperlinkUpsert,
+  onPruneHyperlinksForTarget,
+  onJumpToLinkedTarget,
+  onJumpTargetHandled,
   onToggleFollowUpMode,
+  onToggleNoteMode,
   onBookmarkDraftChange,
   onToggleBookmark,
   onToggleBookmarkEditor,
@@ -64,7 +102,12 @@ export default function ExplanationPanel({
 }: Props) {
   const isZh = locale === 'zh'
   const explanation = explanations[currentPage]
+  const isFollowUpMode = activeMode === 'follow-up'
+  const isNoteMode = activeMode === 'note'
   const bookmarkRef = useRef<HTMLDivElement | null>(null)
+  const messageTimerRef = useRef<number | null>(null)
+  const followUpRefs = useRef<Record<string, HTMLElement | null>>({})
+  const noteRefs = useRef<Record<string, HTMLElement | null>>({})
   const [isEditing, setIsEditing] = useState(false)
   const [editText, setEditText] = useState('')
   const [isSaving, setIsSaving] = useState(false)
@@ -74,7 +117,15 @@ export default function ExplanationPanel({
   const [editFollowUpQuestion, setEditFollowUpQuestion] = useState('')
   const [editFollowUpAnswer, setEditFollowUpAnswer] = useState('')
   const [isSavingFollowUp, setIsSavingFollowUp] = useState(false)
-  const [followUpMenu, setFollowUpMenu] = useState<FollowUpMenuState>(null)
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
+  const [editNoteContent, setEditNoteContent] = useState('')
+  const [isSavingNote, setIsSavingNote] = useState(false)
+  const [isCreatingNote, setIsCreatingNote] = useState(false)
+  const [newNoteContent, setNewNoteContent] = useState('')
+  const [isCreatingNoteSaving, setIsCreatingNoteSaving] = useState(false)
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null)
+  const [isHyperlinkDrawerOpen, setIsHyperlinkDrawerOpen] = useState(false)
+
   const renderedExplanation = useMemo(
     () => renderExplanationMarkdown(explanation || ''),
     [explanation],
@@ -83,24 +134,59 @@ export default function ExplanationPanel({
     () => ({ '--ai-font-size': `${fontSize}px` } as CSSProperties),
     [fontSize],
   )
+  const currentPageHyperlinks = useMemo(
+    () => hyperlinks.filter((item) => item.page_number === currentPage),
+    [currentPage, hyperlinks],
+  )
+  const groupedHyperlinks = useMemo(() => {
+    const groups = new Map<number, HyperlinkRecord[]>()
+    for (const hyperlink of hyperlinks) {
+      const bucket = groups.get(hyperlink.page_number) ?? []
+      bucket.push(hyperlink)
+      groups.set(hyperlink.page_number, bucket)
+    }
+    return [...groups.entries()].sort((left, right) => left[0] - right[0])
+  }, [hyperlinks])
+
+  const flashMessage = useCallback((message: string) => {
+    setSaveMsg(message)
+    if (messageTimerRef.current !== null) {
+      window.clearTimeout(messageTimerRef.current)
+    }
+    messageTimerRef.current = window.setTimeout(() => {
+      setSaveMsg('')
+      messageTimerRef.current = null
+    }, 2200)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (messageTimerRef.current !== null) {
+        window.clearTimeout(messageTimerRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     setIsEditing(false)
     setSaveMsg('')
     setEditingFollowUpId(null)
-    setFollowUpMenu(null)
+    setEditingNoteId(null)
+    setIsCreatingNote(false)
+    setNewNoteContent('')
+    setContextMenu(null)
   }, [currentPage])
 
   useEffect(() => {
-    if (!followUpMenu) return
-    const closeMenu = () => setFollowUpMenu(null)
+    if (!contextMenu) return
+    const closeMenu = () => setContextMenu(null)
     window.addEventListener('click', closeMenu)
     window.addEventListener('scroll', closeMenu, true)
     return () => {
       window.removeEventListener('click', closeMenu)
       window.removeEventListener('scroll', closeMenu, true)
     }
-  }, [followUpMenu])
+  }, [contextMenu])
 
   useEffect(() => {
     if (!isBookmarkEditorOpen) return
@@ -129,6 +215,13 @@ export default function ExplanationPanel({
     }
   }, [editingFollowUpId, followUps])
 
+  useEffect(() => {
+    if (!editingNoteId) return
+    if (!notes.some((item) => item.id === editingNoteId)) {
+      setEditingNoteId(null)
+    }
+  }, [editingNoteId, notes])
+
   const handleStartEdit = useCallback(() => {
     setEditText(explanation || '')
     setIsEditing(true)
@@ -152,19 +245,20 @@ export default function ExplanationPanel({
       await saveEditedExplanation(pdfHash, currentPage, editText)
       onExplanationUpdate(currentPage, editText)
       setIsEditing(false)
-      setSaveMsg(isZh ? '讲解已保存' : 'Explanation saved')
-      setTimeout(() => setSaveMsg(''), 2000)
+      flashMessage(isZh ? '讲解已保存' : 'Explanation saved')
     } catch {
       setSaveMsg(isZh ? '讲解保存失败' : 'Failed to save explanation')
     } finally {
       setIsSaving(false)
     }
-  }, [pdfHash, currentPage, editText, isZh, onExplanationUpdate])
+  }, [currentPage, editText, flashMessage, isZh, onExplanationUpdate, pdfHash])
 
-  const handleOpenFollowUpMenu = useCallback((event: ReactMouseEvent, followUpId: string) => {
+  const handleOpenContextMenu = useCallback((event: ReactMouseEvent, kind: ContextMenuKind, id: string) => {
     event.preventDefault()
-    setFollowUpMenu({
-      followUpId,
+    event.stopPropagation()
+    setContextMenu({
+      kind,
+      id,
       x: event.clientX,
       y: event.clientY,
     })
@@ -176,7 +270,7 @@ export default function ExplanationPanel({
     setEditingFollowUpId(followUpId)
     setEditFollowUpQuestion(target.question)
     setEditFollowUpAnswer(target.answer)
-    setFollowUpMenu(null)
+    setContextMenu(null)
     setSaveMsg('')
   }, [followUps])
 
@@ -204,8 +298,7 @@ export default function ExplanationPanel({
       setEditingFollowUpId(null)
       setEditFollowUpQuestion('')
       setEditFollowUpAnswer('')
-      setSaveMsg(isZh ? '追问已保存' : 'Follow-up saved')
-      setTimeout(() => setSaveMsg(''), 2000)
+      flashMessage(isZh ? '追问已保存' : 'Follow-up saved')
     } catch {
       setSaveMsg(isZh ? '追问保存失败' : 'Failed to save follow-up')
     } finally {
@@ -216,6 +309,7 @@ export default function ExplanationPanel({
     editFollowUpAnswer,
     editFollowUpQuestion,
     editingFollowUpId,
+    flashMessage,
     followUps,
     isZh,
     onFollowUpsUpdate,
@@ -224,20 +318,164 @@ export default function ExplanationPanel({
 
   const handleDeleteFollowUp = useCallback(async (followUpId: string) => {
     if (!pdfHash) return
-    setFollowUpMenu(null)
+    setContextMenu(null)
     try {
       await deleteFollowUp(pdfHash, currentPage, followUpId)
       const nextItems = followUps.filter((item) => item.id !== followUpId)
       onFollowUpsUpdate(currentPage, nextItems)
+      onPruneHyperlinksForTarget(currentPage, 'followup', followUpId)
       if (editingFollowUpId === followUpId) {
-        setEditingFollowUpId(null)
+        handleCancelEditFollowUp()
       }
-      setSaveMsg(isZh ? '追问已删除' : 'Follow-up deleted')
-      setTimeout(() => setSaveMsg(''), 2000)
+      flashMessage(isZh ? '追问已删除' : 'Follow-up deleted')
     } catch {
       setSaveMsg(isZh ? '删除追问失败' : 'Failed to delete follow-up')
     }
-  }, [currentPage, editingFollowUpId, followUps, isZh, onFollowUpsUpdate, pdfHash])
+  }, [
+    currentPage,
+    editingFollowUpId,
+    flashMessage,
+    followUps,
+    handleCancelEditFollowUp,
+    isZh,
+    onFollowUpsUpdate,
+    onPruneHyperlinksForTarget,
+    pdfHash,
+  ])
+
+  const handleStartEditNote = useCallback((noteId: string) => {
+    const target = notes.find((item) => item.id === noteId)
+    if (!target) return
+    setEditingNoteId(noteId)
+    setEditNoteContent(target.content)
+    setContextMenu(null)
+    setSaveMsg('')
+  }, [notes])
+
+  const handleCancelEditNote = useCallback(() => {
+    setEditingNoteId(null)
+    setEditNoteContent('')
+  }, [])
+
+  const handleSaveNote = useCallback(async () => {
+    if (!pdfHash || !editingNoteId || !editNoteContent.trim()) {
+      return
+    }
+    setIsSavingNote(true)
+    setSaveMsg('')
+    try {
+      const updated = await updateNote(pdfHash, currentPage, editingNoteId, {
+        content: editNoteContent,
+      })
+      onNotesUpdate(
+        currentPage,
+        notes.map((item) => (item.id === editingNoteId ? updated : item)),
+      )
+      setEditingNoteId(null)
+      setEditNoteContent('')
+      flashMessage(isZh ? '笔记已保存' : 'Note saved')
+    } catch {
+      setSaveMsg(isZh ? '笔记保存失败' : 'Failed to save note')
+    } finally {
+      setIsSavingNote(false)
+    }
+  }, [currentPage, editNoteContent, editingNoteId, flashMessage, isZh, notes, onNotesUpdate, pdfHash])
+
+  const handleCreateNote = useCallback(async () => {
+    if (!pdfHash || !newNoteContent.trim()) {
+      return
+    }
+    setIsCreatingNoteSaving(true)
+    setSaveMsg('')
+    try {
+      const created = await createNote({
+        pdf_hash: pdfHash,
+        page_number: currentPage,
+        content: newNoteContent,
+      })
+      onNotesUpdate(currentPage, [...notes, created])
+      setIsCreatingNote(false)
+      setNewNoteContent('')
+      flashMessage(isZh ? '笔记已添加' : 'Note added')
+    } catch {
+      setSaveMsg(isZh ? '添加笔记失败' : 'Failed to add note')
+    } finally {
+      setIsCreatingNoteSaving(false)
+    }
+  }, [currentPage, flashMessage, isZh, newNoteContent, notes, onNotesUpdate, pdfHash])
+
+  const handleDeleteNote = useCallback(async (noteId: string) => {
+    if (!pdfHash) return
+    setContextMenu(null)
+    try {
+      await deleteNote(pdfHash, currentPage, noteId)
+      const nextItems = notes.filter((item) => item.id !== noteId)
+      onNotesUpdate(currentPage, nextItems)
+      onPruneHyperlinksForTarget(currentPage, 'note', noteId)
+      if (editingNoteId === noteId) {
+        handleCancelEditNote()
+      }
+      flashMessage(isZh ? '笔记已删除' : 'Note deleted')
+    } catch {
+      setSaveMsg(isZh ? '删除笔记失败' : 'Failed to delete note')
+    }
+  }, [
+    currentPage,
+    editingNoteId,
+    flashMessage,
+    handleCancelEditNote,
+    isZh,
+    notes,
+    onNotesUpdate,
+    onPruneHyperlinksForTarget,
+    pdfHash,
+  ])
+
+  const handleCreateHyperlinkForTarget = useCallback(async (targetType: 'followup' | 'note', targetId: string) => {
+    if (!pdfHash) return
+    const targetText = targetType === 'followup'
+      ? (followUps.find((item) => item.id === targetId)?.question ?? '')
+      : (notes.find((item) => item.id === targetId)?.content ?? '')
+    const displayText = targetText.trim()
+    if (!displayText) {
+      setSaveMsg(isZh ? '没有可用的超链接文本' : 'No text available for hyperlink')
+      return
+    }
+
+    const nextSlot = currentPageHyperlinks.length
+    const positionX = 0.08 + (nextSlot % 2) * 0.28
+    const positionY = 0.1 + Math.floor(nextSlot / 2) * 0.12
+
+    try {
+      const created = await createHyperlink({
+        pdf_hash: pdfHash,
+        page_number: currentPage,
+        target_type: targetType,
+        target_id: targetId,
+        display_text: displayText,
+        position_x: positionX,
+        position_y: positionY,
+      })
+      onHyperlinkUpsert(created)
+      setContextMenu(null)
+      flashMessage(isZh ? '超链接已生成' : 'Hyperlink created')
+    } catch {
+      setSaveMsg(isZh ? '生成超链接失败' : 'Failed to create hyperlink')
+    }
+  }, [currentPage, currentPageHyperlinks.length, flashMessage, followUps, isZh, notes, onHyperlinkUpsert, pdfHash])
+
+  useEffect(() => {
+    if (!jumpTarget || jumpTarget.pageNumber !== currentPage) return
+    const targetMap = jumpTarget.targetType === 'followup' ? followUpRefs.current : noteRefs.current
+    const element = targetMap[jumpTarget.targetId]
+    if (!element) return
+    element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    onJumpTargetHandled()
+  }, [currentPage, jumpTarget, onJumpTargetHandled, followUps, notes])
+
+  const handleActivateHyperlink = useCallback((hyperlink: HyperlinkRecord) => {
+    onJumpToLinkedTarget(hyperlink.page_number, hyperlink.target_type, hyperlink.target_id)
+  }, [onJumpToLinkedTarget])
 
   const parsedCount = Object.keys(explanations).length
   const pageStatus = isLoading
@@ -251,11 +489,13 @@ export default function ExplanationPanel({
     : explanation
       ? 'page-status--parsed'
       : 'page-status--empty'
+  const isFollowUpLoading = isLoading && isFollowUpMode
+  const shouldShowMainLoading = isLoading && !isFollowUpLoading
 
-  const menuStyle = followUpMenu
+  const menuStyle = contextMenu
     ? {
-        left: Math.max(12, Math.min(followUpMenu.x, window.innerWidth - 176)),
-        top: Math.max(12, Math.min(followUpMenu.y, window.innerHeight - 120)),
+        left: Math.max(12, Math.min(contextMenu.x, window.innerWidth - 196)),
+        top: Math.max(12, Math.min(contextMenu.y, window.innerHeight - 180)),
       }
     : undefined
 
@@ -273,6 +513,13 @@ export default function ExplanationPanel({
           )}
         </div>
         <div className="explanation-header-right">
+          <button
+            type="button"
+            className={`edit-btn hyperlink-drawer-toggle${isHyperlinkDrawerOpen ? ' edit-btn--active' : ''}`}
+            onClick={() => setIsHyperlinkDrawerOpen((prev) => !prev)}
+          >
+            {isZh ? `超链接 ${hyperlinks.length > 0 ? `(${hyperlinks.length})` : ''}` : `Links${hyperlinks.length > 0 ? ` (${hyperlinks.length})` : ''}`}
+          </button>
           <label className="ctrl-check ctrl-check--pill explanation-bookmark-toggle">
             <input
               type="checkbox"
@@ -306,6 +553,49 @@ export default function ExplanationPanel({
       </div>
 
       <div className="explanation-body-wrap">
+        {isHyperlinkDrawerOpen && (
+          <aside className="hyperlink-drawer" onPointerDown={(event) => event.stopPropagation()}>
+            <div className="hyperlink-drawer__header">
+              <strong>{isZh ? '全部超链接' : 'All hyperlinks'}</strong>
+              <button type="button" className="edit-btn" onClick={() => setIsHyperlinkDrawerOpen(false)}>
+                {isZh ? '收起' : 'Close'}
+              </button>
+            </div>
+            {groupedHyperlinks.length > 0 ? (
+              <div className="hyperlink-drawer__list">
+                {groupedHyperlinks.map(([pageNumber, items]) => (
+                  <section key={pageNumber} className="hyperlink-drawer__group">
+                    <div className="hyperlink-drawer__group-title">
+                      {isZh ? `第 ${pageNumber} 页` : `Page ${pageNumber}`}
+                    </div>
+                    <div className="hyperlink-drawer__group-items">
+                      {items.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className="hyperlink-drawer__item"
+                          onClick={() => handleActivateHyperlink(item)}
+                        >
+                          <span className="hyperlink-drawer__item-text">{item.display_text}</span>
+                          <span className="hyperlink-drawer__item-meta">
+                            {item.target_type === 'followup'
+                              ? (isZh ? '追问' : 'Follow-up')
+                              : (isZh ? '笔记' : 'Note')}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            ) : (
+              <p className="hyperlink-drawer__empty">
+                {isZh ? '还没有生成任何超链接。' : 'No hyperlinks yet.'}
+              </p>
+            )}
+          </aside>
+        )}
+
         {isCurrentPageBookmarked && (
           <div ref={bookmarkRef} className="explanation-bookmark-floating">
             <div className="page-bookmark-wrap page-bookmark-wrap--floating">
@@ -350,35 +640,46 @@ export default function ExplanationPanel({
         )}
 
         <div className="explanation-body">
-        {isLoading ? (
-          <div className="explanation-loading">
-            <div className="spinner" />
-            <p>{isZh ? '正在处理当前页...' : 'Processing current page...'}</p>
-          </div>
-        ) : isEditing ? (
-          <div className="explanation-editor">
-            <textarea
-              className="explanation-textarea"
-              value={editText}
-              onChange={(e) => setEditText(e.target.value)}
-              rows={16}
-            />
-            <div className="button-row">
-              <button type="button" onClick={handleSaveExplanation} disabled={isSaving}>
-                {isSaving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存' : 'Save')}
-              </button>
-              <button type="button" className="secondary" onClick={handleCancelEdit}>
-                {isZh ? '取消' : 'Cancel'}
-              </button>
-            </div>
-          </div>
-        ) : explanation ? (
           <div className="explanation-stack">
-            <div
-              className="explanation-content"
-              dangerouslySetInnerHTML={{ __html: renderedExplanation }}
-            />
-            {(followUps.length > 0 || isFollowUpMode) && (
+            {shouldShowMainLoading ? (
+              <div className="explanation-loading">
+                <div className="spinner" />
+                <p>{isZh ? '正在处理当前页...' : 'Processing current page...'}</p>
+              </div>
+            ) : isEditing ? (
+              <div className="explanation-editor">
+                <textarea
+                  className="explanation-textarea"
+                  value={editText}
+                  onChange={(event) => setEditText(event.target.value)}
+                  rows={16}
+                />
+                <div className="button-row">
+                  <button type="button" onClick={handleSaveExplanation} disabled={isSaving}>
+                    {isSaving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存' : 'Save')}
+                  </button>
+                  <button type="button" className="secondary" onClick={handleCancelEdit}>
+                    {isZh ? '取消' : 'Cancel'}
+                  </button>
+                </div>
+              </div>
+            ) : explanation ? (
+              <div
+                className="explanation-content"
+                dangerouslySetInnerHTML={{ __html: renderedExplanation }}
+              />
+            ) : (
+              <div className="explanation-empty">
+                <div className="empty-icon">?</div>
+                <p>
+                  {isZh
+                    ? '当前页尚未解析。点击下方“解析当前页”按钮开始 AI 讲解。'
+                    : 'This page has not been parsed yet. Click "Parse current page" below to start.'}
+                </p>
+              </div>
+            )}
+
+            {(followUps.length > 0 || isFollowUpMode || isFollowUpLoading) && (
               <section className={`follow-up-card${isFollowUpMode ? ' follow-up-card--active' : ''}`}>
                 <div className="follow-up-card-header">
                   <span>
@@ -390,22 +691,25 @@ export default function ExplanationPanel({
                     <span className="follow-up-card-badge">{isZh ? '追问模式' : 'Follow-up mode'}</span>
                   )}
                 </div>
-                {followUps.length > 0 ? (
+                {(followUps.length > 0 || isFollowUpLoading) ? (
                   <div className="follow-up-list">
                     {followUps.map((followUp, index) => {
                       const isEditingFollowUp = editingFollowUpId === followUp.id
                       return (
                         <article
                           key={followUp.id}
+                          ref={(node) => {
+                            followUpRefs.current[followUp.id] = node
+                          }}
                           className="follow-up-item"
-                          onContextMenu={(event) => handleOpenFollowUpMenu(event, followUp.id)}
+                          onContextMenu={(event) => handleOpenContextMenu(event, 'followup', followUp.id)}
                         >
                           <div className="follow-up-item-top">
                             <span className="follow-up-item-index">
                               {isZh ? `追问 ${index + 1}` : `Follow-up ${index + 1}`}
                             </span>
                             <span className="follow-up-item-hint">
-                              {isZh ? '右键可编辑或删除' : 'Right click to edit or delete'}
+                              {isZh ? '右键可编辑、删除或生成超链接' : 'Right click to edit, delete, or create a hyperlink'}
                             </span>
                           </div>
                           {isEditingFollowUp ? (
@@ -445,6 +749,19 @@ export default function ExplanationPanel({
                         </article>
                       )
                     })}
+                    {isFollowUpLoading && (
+                      <article className="follow-up-item follow-up-item--pending">
+                        <div className="follow-up-item-top">
+                          <span className="follow-up-item-index">
+                            {isZh ? '正在追问' : 'Follow-up pending'}
+                          </span>
+                        </div>
+                        <div className="follow-up-pending">
+                          <div className="spinner" />
+                          <p>{isZh ? '正在生成本次追问回复...' : 'Generating the follow-up reply...'}</p>
+                        </div>
+                      </article>
+                    )}
                   </div>
                 ) : (
                   <p className="follow-up-empty">
@@ -455,17 +772,118 @@ export default function ExplanationPanel({
                 )}
               </section>
             )}
+
+            {(notes.length > 0 || isNoteMode) && (
+              <section className={`note-card${isNoteMode ? ' note-card--active' : ''}`}>
+                <div className="follow-up-card-header">
+                  <span>
+                    {isZh
+                      ? `当前页笔记 ${notes.length > 0 ? `· ${notes.length} 条` : ''}`
+                      : `Current notes${notes.length > 0 ? ` · ${notes.length}` : ''}`}
+                  </span>
+                  {isNoteMode && (
+                    <span className="follow-up-card-badge">{isZh ? '笔记模式' : 'Note mode'}</span>
+                  )}
+                </div>
+                {isNoteMode && (
+                  <div
+                    className={`note-compose-surface${isCreatingNote ? ' note-compose-surface--editing' : ''}`}
+                    onClick={() => {
+                      if (!isCreatingNote) {
+                        setIsCreatingNote(true)
+                      }
+                    }}
+                  >
+                    {isCreatingNote ? (
+                      <>
+                        <textarea
+                          className="follow-up-textarea note-compose-textarea"
+                          value={newNoteContent}
+                          onChange={(event) => setNewNoteContent(event.target.value)}
+                          rows={8}
+                          autoFocus
+                          placeholder={isZh ? '在这里记录这一页的理解、疑问或待回看内容' : 'Write your page note here'}
+                        />
+                        <div className="button-row">
+                          <button type="button" onClick={() => void handleCreateNote()} disabled={isCreatingNoteSaving || !newNoteContent.trim()}>
+                            {isCreatingNoteSaving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存笔记' : 'Save note')}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => {
+                              setIsCreatingNote(false)
+                              setNewNoteContent('')
+                            }}
+                            disabled={isCreatingNoteSaving}
+                          >
+                            {isZh ? '取消' : 'Cancel'}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <p className="note-compose-placeholder">
+                        {isZh ? '点击这块空白区域，直接开始记录本页笔记。' : 'Click this blank area to start writing a note for this page.'}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {notes.length > 0 ? (
+                  <div className="note-list">
+                    {notes.map((note, index) => {
+                      const isEditingCurrentNote = editingNoteId === note.id
+                      return (
+                        <article
+                          key={note.id}
+                          ref={(node) => {
+                            noteRefs.current[note.id] = node
+                          }}
+                          className="note-item"
+                          onContextMenu={(event) => handleOpenContextMenu(event, 'note', note.id)}
+                        >
+                          <div className="follow-up-item-top">
+                            <span className="follow-up-item-index">
+                              {isZh ? `笔记 ${index + 1}` : `Note ${index + 1}`}
+                            </span>
+                            <span className="follow-up-item-hint">
+                              {isZh ? '右键可编辑、删除或生成超链接' : 'Right click to edit, delete, or create a hyperlink'}
+                            </span>
+                          </div>
+                          {isEditingCurrentNote ? (
+                            <div className="follow-up-editor">
+                              <label className="follow-up-question-label">{isZh ? '内容' : 'Content'}</label>
+                              <textarea
+                                className="follow-up-textarea"
+                                value={editNoteContent}
+                                onChange={(event) => setEditNoteContent(event.target.value)}
+                                rows={7}
+                              />
+                              <div className="button-row">
+                                <button type="button" onClick={handleSaveNote} disabled={isSavingNote}>
+                                  {isSavingNote ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存笔记' : 'Save note')}
+                                </button>
+                                <button type="button" className="secondary" onClick={handleCancelEditNote}>
+                                  {isZh ? '取消' : 'Cancel'}
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="note-item-content">{note.content}</p>
+                          )}
+                        </article>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <p className="follow-up-empty">
+                    {isZh
+                      ? '当前页还没有笔记。'
+                      : 'No notes for this page yet.'}
+                  </p>
+                )}
+              </section>
+            )}
           </div>
-        ) : (
-          <div className="explanation-empty">
-            <div className="empty-icon">?</div>
-            <p>
-              {isZh
-                ? '当前页尚未解析。点击下方“解析当前页”按钮开始 AI 讲解。'
-                : 'This page has not been parsed yet. Click "Parse current page" below to start.'}
-            </p>
-          </div>
-        )}
         </div>
       </div>
 
@@ -473,26 +891,51 @@ export default function ExplanationPanel({
         <div className="explanation-footer-left">
           {saveMsg && <span className="save-msg">{saveMsg}</span>}
         </div>
-        {explanation && !isEditing && !isLoading && (
+        {!isEditing && !shouldShowMainLoading && (
           <div className="explanation-footer-actions">
-            <button type="button" className="edit-btn" onClick={handleStartEdit}>
-              {isZh ? '编辑讲解' : 'Edit'}
-            </button>
-            <button type="button" className={`edit-btn${isFollowUpMode ? ' edit-btn--active' : ''}`} onClick={onToggleFollowUpMode}>
+            {explanation && (
+              <button type="button" className="edit-btn" onClick={handleStartEdit} disabled={isLoading}>
+                {isZh ? '编辑讲解' : 'Edit'}
+              </button>
+            )}
+            <button type="button" className={`edit-btn${isFollowUpMode ? ' edit-btn--active' : ''}`} onClick={onToggleFollowUpMode} disabled={isLoading}>
               {isFollowUpMode ? (isZh ? '结束追问' : 'Close follow-up') : (isZh ? '追问' : 'Follow-up')}
+            </button>
+            <button type="button" className={`edit-btn${isNoteMode ? ' edit-btn--active' : ''}`} onClick={onToggleNoteMode}>
+              {isNoteMode ? (isZh ? '结束笔记' : 'Close notes') : (isZh ? '笔记' : 'Notes')}
             </button>
           </div>
         )}
       </div>
 
-      {followUpMenu && (
+      {contextMenu && (
         <div className="follow-up-context-menu" style={menuStyle}>
-          <button type="button" onClick={() => handleStartEditFollowUp(followUpMenu.followUpId)}>
-            {isZh ? '编辑追问' : 'Edit follow-up'}
-          </button>
-          <button type="button" className="follow-up-context-menu__danger" onClick={() => void handleDeleteFollowUp(followUpMenu.followUpId)}>
-            {isZh ? '删除追问' : 'Delete follow-up'}
-          </button>
+          {contextMenu.kind === 'followup' && (
+            <>
+              <button type="button" onClick={() => handleStartEditFollowUp(contextMenu.id)}>
+                {isZh ? '编辑追问' : 'Edit follow-up'}
+              </button>
+              <button type="button" onClick={() => void handleCreateHyperlinkForTarget('followup', contextMenu.id)}>
+                {isZh ? '生成超链接' : 'Create hyperlink'}
+              </button>
+              <button type="button" className="follow-up-context-menu__danger" onClick={() => void handleDeleteFollowUp(contextMenu.id)}>
+                {isZh ? '删除追问' : 'Delete follow-up'}
+              </button>
+            </>
+          )}
+          {contextMenu.kind === 'note' && (
+            <>
+              <button type="button" onClick={() => handleStartEditNote(contextMenu.id)}>
+                {isZh ? '编辑笔记' : 'Edit note'}
+              </button>
+              <button type="button" onClick={() => void handleCreateHyperlinkForTarget('note', contextMenu.id)}>
+                {isZh ? '生成超链接' : 'Create hyperlink'}
+              </button>
+              <button type="button" className="follow-up-context-menu__danger" onClick={() => void handleDeleteNote(contextMenu.id)}>
+                {isZh ? '删除笔记' : 'Delete note'}
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>

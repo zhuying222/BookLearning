@@ -99,6 +99,7 @@ export function parseSinglePage(data: {
   pdf_hash: string
   page_number: number
   image_base64: string
+  extra_images_base64?: string[]
   config_id?: string
   page_prompt?: string
   force?: boolean
@@ -122,10 +123,32 @@ export type FollowUpResponse = {
   cost_info: ParseCostInfo | null
 }
 
+export type NoteRecord = {
+  id: string
+  content: string
+  created_at: string
+  updated_at: string
+}
+
+export type HyperlinkTargetType = 'followup' | 'note'
+
+export type HyperlinkRecord = {
+  id: string
+  page_number: number
+  target_type: HyperlinkTargetType
+  target_id: string
+  display_text: string
+  position_x: number
+  position_y: number
+  created_at: string
+  updated_at: string
+}
+
 export function followUpPage(data: {
   pdf_hash: string
   page_number: number
   image_base64: string
+  extra_images_base64?: string[]
   question: string
   current_explanation: string
   config_id?: string
@@ -192,6 +215,86 @@ export function loadAllCachedExplanations(pdfHash: string) {
 
 export function loadSavedFollowUps(pdfHash: string) {
   return request<{ pdf_hash: string; pages: Record<number, FollowUpRecord[]> }>(`/parse/follow-up/${pdfHash}`)
+}
+
+export function loadSavedNotes(pdfHash: string) {
+  return request<{ pdf_hash: string; pages: Record<number, NoteRecord[]> }>(`/annotations/notes/${pdfHash}`)
+}
+
+export function createNote(data: {
+  pdf_hash: string
+  page_number: number
+  content: string
+}) {
+  return request<NoteRecord>('/annotations/notes', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export function updateNote(
+  pdfHash: string,
+  pageNumber: number,
+  noteId: string,
+  data: { content: string },
+) {
+  return request<NoteRecord>(`/annotations/notes/${pdfHash}/${pageNumber}/${noteId}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export function deleteNote(pdfHash: string, pageNumber: number, noteId: string) {
+  return request<{ ok: boolean }>(`/annotations/notes/${pdfHash}/${pageNumber}/${noteId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function loadSavedHyperlinks(pdfHash: string) {
+  return request<{ pdf_hash: string; hyperlinks: HyperlinkRecord[] }>(`/annotations/hyperlinks/${pdfHash}`)
+}
+
+export function createHyperlink(data: {
+  pdf_hash: string
+  page_number: number
+  target_type: HyperlinkTargetType
+  target_id: string
+  display_text: string
+  position_x?: number
+  position_y?: number
+}) {
+  return request<HyperlinkRecord>('/annotations/hyperlinks', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
+export function updateHyperlinkPosition(
+  pdfHash: string,
+  hyperlinkId: string,
+  data: { position_x: number; position_y: number },
+) {
+  return request<HyperlinkRecord>(`/annotations/hyperlinks/${pdfHash}/${hyperlinkId}/position`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export function updateHyperlinkText(
+  pdfHash: string,
+  hyperlinkId: string,
+  data: { display_text: string },
+) {
+  return request<HyperlinkRecord>(`/annotations/hyperlinks/${pdfHash}/${hyperlinkId}/text`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export function deleteHyperlink(pdfHash: string, hyperlinkId: string) {
+  return request<{ ok: boolean }>(`/annotations/hyperlinks/${pdfHash}/${hyperlinkId}`, {
+    method: 'DELETE',
+  })
 }
 
 // Documents

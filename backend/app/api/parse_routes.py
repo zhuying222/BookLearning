@@ -1,4 +1,5 @@
 import logging
+import hashlib
 
 from fastapi import APIRouter, HTTPException
 
@@ -15,7 +16,7 @@ from app.models.parse import (
     TaskStatusResponse,
     UpdateFollowUpRequest,
 )
-from app.services import ai_config_service, cache_service, followup_service, task_service
+from app.services import ai_config_service, cache_service, followup_service, hyperlink_service, task_service
 from app.services.activity_service import log_activity
 from app.services.ai_service import call_vision_model
 from app.services.prompt_service import get_prompt_config
@@ -37,11 +38,17 @@ async def parse_single_page(req: ParsePageRequest):
 
     prompt_cfg = get_prompt_config()
     user_prompt = req.page_prompt or prompt_cfg.user_prompt_template
+    attachment_signature = _build_attachment_signature(req.extra_images_base64)
+    cache_prompt = (
+        f"{user_prompt}\n\n[extra_images:{attachment_signature}]"
+        if attachment_signature
+        else user_prompt
+    )
 
     if not req.force:
         cached = cache_service.get_cached_record(
             req.pdf_hash, req.page_number, config.model_name,
-            prompt_cfg.system_prompt, user_prompt,
+            prompt_cfg.system_prompt, cache_prompt,
         )
         if cached is not None:
             cost_info = cached.get("cost_info")
@@ -60,6 +67,7 @@ async def parse_single_page(req: ParsePageRequest):
         explanation, cost_info = await call_vision_model(
             config=config,
             image_base64=req.image_base64,
+            extra_images_base64=req.extra_images_base64,
             page_prompt=req.page_prompt,
             context_summary=context_summary,
         )
@@ -74,7 +82,7 @@ async def parse_single_page(req: ParsePageRequest):
 
     cache_service.save_cached_result(
         req.pdf_hash, req.page_number, config.model_name,
-        prompt_cfg.system_prompt, user_prompt, explanation,
+        prompt_cfg.system_prompt, cache_prompt, explanation,
         ParseCostInfo(**cost_info.__dict__) if cost_info else None,
     )
 
@@ -100,22 +108,32 @@ async def follow_up_page(req: FollowUpRequest):
         raise HTTPException(status_code=400, detail="No AI config available. Please add one in AI Config panel.")
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
-    if not req.current_explanation.strip():
-        raise HTTPException(status_code=400, detail="Current explanation cannot be empty")
 
     context_summary = _build_context_for_page(req.pdf_hash, req.page_number)
-    extra_system_prompt = (
-        "当前页面已经有一份基础讲解。你现在处于追问模式。\n"
-        "请优先回答用户这一次追问，不要整页重写。\n"
-        "如果已有讲解与图片内容冲突，以图片内容为准并直接指出修正。\n"
-        f"当前页已有讲解如下：\n{req.current_explanation.strip()}"
+    if req.current_explanation.strip():
+        extra_system_prompt = (
+            "当前页面已经有一份基础讲解。你现在处于追问模式。\n"
+            "请优先回答用户这一次追问，不要整页重写。\n"
+            "如果已有讲解与图片内容冲突，以图片内容为准并直接指出修正。\n"
+            f"当前页已有讲解如下：\n{req.current_explanation.strip()}"
+        )
+    else:
+        extra_system_prompt = (
+            "当前页面还没有基础讲解。你现在处于直接提问模式。\n"
+            "请根据当前页图片直接回答用户问题，必要时自行补足背景说明。\n"
+            "不要假设已有讲解存在。"
+        )
+    user_text = (
+        f"请结合当前页图片和已有讲解，回答这次追问：\n{req.question.strip()}"
+        if req.current_explanation.strip()
+        else f"请根据当前页图片直接回答这个问题：\n{req.question.strip()}"
     )
-    user_text = f"请结合当前页图片和已有讲解，回答这次追问：\n{req.question.strip()}"
 
     try:
         answer, cost_info = await call_vision_model(
             config=config,
             image_base64=req.image_base64,
+            extra_images_base64=req.extra_images_base64,
             context_summary=context_summary,
             extra_system_prompt=extra_system_prompt,
             user_text_override=user_text,
@@ -266,6 +284,7 @@ async def delete_followup(pdf_hash: str, page_number: int, followup_id: str):
     deleted = followup_service.delete_followup(pdf_hash, page_number, followup_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Follow-up not found")
+    hyperlink_service.delete_hyperlinks_for_target(pdf_hash, page_number, "followup", followup_id)
     return {"ok": True, "pdf_hash": pdf_hash, "page_number": page_number, "followup_id": followup_id}
 
 
@@ -279,3 +298,13 @@ def _build_context_for_page(pdf_hash: str, page_number: int, context_pages: int 
         if cached:
             summaries.append(f"第{prev_page}页：{cached}")
     return "\n".join(summaries) if summaries else None
+
+
+def _build_attachment_signature(images_base64: list[str]) -> str | None:
+    if not images_base64:
+        return None
+
+    digest = hashlib.sha256()
+    for image_base64 in images_base64:
+        digest.update(hashlib.sha256(image_base64.encode("utf-8")).digest())
+    return digest.hexdigest()[:16]
